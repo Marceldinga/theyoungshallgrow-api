@@ -108,14 +108,58 @@ def _internet_enabled() -> bool:
     return bool(TAVILY_API_KEY)
 
 
+# ---- Robust Supabase init (never crash on invalid key) -----------------------
+_SUPABASE_INIT_ERROR = ""
+
+
+def _clean_env_value(v: Optional[str]) -> str:
+    """Trim whitespace/newlines and remove wrapping quotes."""
+    if not v:
+        return ""
+    v = v.strip()
+    # remove wrapping quotes if present
+    if (len(v) >= 2) and ((v[0] == v[-1]) and v[0] in ('"', "'")):
+        v = v[1:-1].strip()
+    return v
+
+
 def _supabase_clients():
-    # Backend should use service key if present; fallback to anon for public-read only.
+    """
+    Backend should use service key if present; fallback to anon for public-read only.
+    CRITICAL: Never crash app at import-time if keys are invalid.
+    """
+    global _SUPABASE_INIT_ERROR
+
+    url = _clean_env_value(SUPABASE_URL)
+    anon = _clean_env_value(SUPABASE_ANON_KEY)
+    service = _clean_env_value(SUPABASE_SERVICE_KEY)
+
     sb_anon = None
     sb_service = None
-    if SUPABASE_URL and SUPABASE_ANON_KEY:
-        sb_anon = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
-        sb_service = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+    if not url:
+        _SUPABASE_INIT_ERROR = "SUPABASE_URL missing"
+        return None, None
+
+    # anon
+    if anon:
+        try:
+            sb_anon = create_client(url, anon)
+        except Exception as e:
+            _SUPABASE_INIT_ERROR = f"Anon key error: {e}"
+
+    # service (optional; do not crash on failure)
+    if service:
+        try:
+            sb_service = create_client(url, service)
+        except Exception as e:
+            # keep anon working; just record error
+            if _SUPABASE_INIT_ERROR:
+                _SUPABASE_INIT_ERROR = _SUPABASE_INIT_ERROR + f" | Service key error: {e}"
+            else:
+                _SUPABASE_INIT_ERROR = f"Service key error: {e}"
+            sb_service = None
+
     return sb_anon, sb_service
 
 
@@ -322,7 +366,11 @@ def _snapshot_to_metrics(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not snapshot:
         return None
 
-    if isinstance(snapshot.get("totals"), dict) or isinstance(snapshot.get("counts"), dict) or isinstance(snapshot.get("ratios"), dict):
+    if (
+        isinstance(snapshot.get("totals"), dict)
+        or isinstance(snapshot.get("counts"), dict)
+        or isinstance(snapshot.get("ratios"), dict)
+    ):
         totals = snapshot.get("totals") or {}
         counts = snapshot.get("counts") or {}
         ratios = snapshot.get("ratios") or {}
@@ -485,11 +533,26 @@ def _is_db_command(text: str) -> bool:
     if _wants_show_table(t) or _wants_describe(t) or _wants_verify_member(t):
         return True
     finance_words = [
-        "contribution", "contributions", "payout", "payouts",
-        "loan", "loans", "repayment", "interest", "unpaid",
-        "overdue", "balance", "exposure", "liquidity",
-        "foundation", "kpi", "kpis", "risk", "health score",
-        "grade", "total",
+        "contribution",
+        "contributions",
+        "payout",
+        "payouts",
+        "loan",
+        "loans",
+        "repayment",
+        "interest",
+        "unpaid",
+        "overdue",
+        "balance",
+        "exposure",
+        "liquidity",
+        "foundation",
+        "kpi",
+        "kpis",
+        "risk",
+        "health score",
+        "grade",
+        "total",
     ]
     return any(w in t for w in finance_words)
 
@@ -513,12 +576,20 @@ def _load_members_truth(schema: str, limit: int = 3000) -> pd.DataFrame:
     out["member_id"] = df[id_col].astype(str)
 
     disp_clean = (
-        df[display_col].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
+        df[display_col]
+        .astype(str)
+        .replace(["None", "nan", "NaN", "NULL", "null"], "")
+        .fillna("")
+        .str.strip()
         if display_col and display_col in df.columns
         else pd.Series([""] * len(df))
     )
     nm_clean = (
-        df[name_col].astype(str).replace(["None", "nan", "NaN", "NULL", "null"], "").fillna("").str.strip()
+        df[name_col]
+        .astype(str)
+        .replace(["None", "nan", "NaN", "NULL", "null"], "")
+        .fillna("")
+        .str.strip()
         if name_col and name_col in df.columns
         else pd.Series([""] * len(df))
     )
@@ -762,15 +833,43 @@ def _build_control_tower_report(metrics: Dict[str, Any]) -> str:
     lines.append("Hello 👋🏽 Njangi Financial Intelligence Review (DB-grounded)\n")
 
     lines.append("1️⃣ Current Situation")
-    lines.append(f"- Total contributions: **{_fmt(metrics.get('total_contributions'))}**" if metrics.get("total_contributions") is not None else "- Total contributions: **Not available**")
-    lines.append(f"- Foundation reserves (total): **{_fmt(metrics.get('foundation_total'))}**" if metrics.get("foundation_total") is not None else "- Foundation reserves: **Not available**")
-    lines.append(f"- Active loan exposure: **{_fmt(metrics.get('active_loan_exposure'))}**" if metrics.get("active_loan_exposure") is not None else "- Active loan exposure: **Not available**")
+    lines.append(
+        f"- Total contributions: **{_fmt(metrics.get('total_contributions'))}**"
+        if metrics.get("total_contributions") is not None
+        else "- Total contributions: **Not available**"
+    )
+    lines.append(
+        f"- Foundation reserves (total): **{_fmt(metrics.get('foundation_total'))}**"
+        if metrics.get("foundation_total") is not None
+        else "- Foundation reserves: **Not available**"
+    )
+    lines.append(
+        f"- Active loan exposure: **{_fmt(metrics.get('active_loan_exposure'))}**"
+        if metrics.get("active_loan_exposure") is not None
+        else "- Active loan exposure: **Not available**"
+    )
     lines.append(f"- Active loans (count): **{int(metrics.get('active_loan_count', 0) or 0)}**")
     lines.append(f"- Overdue loans (count): **{int(metrics.get('overdue_loan_count', 0) or 0)}**")
-    lines.append(f"- Overdue ratio: **{_pct(metrics.get('overdue_ratio'))}**" if metrics.get("overdue_ratio") is not None else "- Overdue ratio: **Not available**")
-    lines.append(f"- Unpaid interest (active): **{_fmt(metrics.get('unpaid_interest'))}**" if metrics.get("unpaid_interest") is not None else "- Unpaid interest: **Not available**")
-    lines.append(f"- Liquidity Pressure Ratio (Exposure ÷ Contributions): **{_pct(metrics.get('liquidity_pressure_ratio'))}**" if metrics.get("liquidity_pressure_ratio") is not None else "- Liquidity Pressure Ratio: **Not available**")
-    lines.append(f"- Interest ledger total: **{_fmt(metrics.get('interest_total'))}**" if metrics.get("interest_total") is not None else "- Interest ledger total: **Not available**")
+    lines.append(
+        f"- Overdue ratio: **{_pct(metrics.get('overdue_ratio'))}**"
+        if metrics.get("overdue_ratio") is not None
+        else "- Overdue ratio: **Not available**"
+    )
+    lines.append(
+        f"- Unpaid interest (active): **{_fmt(metrics.get('unpaid_interest'))}**"
+        if metrics.get("unpaid_interest") is not None
+        else "- Unpaid interest: **Not available**"
+    )
+    lines.append(
+        f"- Liquidity Pressure Ratio (Exposure ÷ Contributions): **{_pct(metrics.get('liquidity_pressure_ratio'))}**"
+        if metrics.get("liquidity_pressure_ratio") is not None
+        else "- Liquidity Pressure Ratio: **Not available**"
+    )
+    lines.append(
+        f"- Interest ledger total: **{_fmt(metrics.get('interest_total'))}**"
+        if metrics.get("interest_total") is not None
+        else "- Interest ledger total: **Not available**"
+    )
 
     lines.append("\n2️⃣ Risk Assessment")
     lines.append(f"- Risk classification: **{risk_label}**")
@@ -920,7 +1019,10 @@ def _hf_call(token: str, messages: List[Dict[str, str]]) -> Tuple[bool, str, str
 
     def _should_try_next(err_text: str) -> bool:
         e = (err_text or "").lower()
-        return any(s in e for s in ["404", "not found", "429", "500", "502", "503", "504", "timeout", "server error", "not supported"])
+        return any(
+            s in e
+            for s in ["404", "not found", "429", "500", "502", "503", "504", "timeout", "server error", "not supported"]
+        )
 
     last_err = ""
     last_mode = "failed"
@@ -1138,9 +1240,10 @@ def health():
         "ok": True,
         "service": APP_NAME,
         "time": datetime.now(timezone.utc).isoformat(),
-        "supabase_url_set": bool(SUPABASE_URL),
-        "supabase_anon_set": bool(SUPABASE_ANON_KEY),
-        "supabase_service_set": bool(SUPABASE_SERVICE_KEY),
+        "supabase_url_set": bool(_clean_env_value(SUPABASE_URL)),
+        "supabase_anon_set": bool(_clean_env_value(SUPABASE_ANON_KEY)),
+        "supabase_service_set": bool(_clean_env_value(SUPABASE_SERVICE_KEY)),
+        "supabase_init_error": _SUPABASE_INIT_ERROR or None,
         "hf_token_set": bool(HF_TOKEN),
         "hf_models_locked": HF_ALLOWED_MODELS,
         "internet": "ON" if _internet_enabled() else "OFF",
