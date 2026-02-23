@@ -16,14 +16,14 @@ from pydantic import BaseModel, Field
 try:
     from supabase import create_client
 except Exception as e:
-    raise RuntimeError("Missing dependency: supabase-py. Add it to requirements.txt") from e
+    raise RuntimeError("Missing dependency: supabase-py. Add `supabase` to requirements.txt") from e
 
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 APP_NAME = "theyoungshallgrow-api (younchat)"
-DEFAULT_SCHEMA = os.getenv("SUPABASE_SCHEMA", "public").strip() or "public"
+DEFAULT_SCHEMA = (os.getenv("SUPABASE_SCHEMA", "public").strip() or "public")
 
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_ROUTER_COMPLETIONS_URL = "https://router.huggingface.co/v1/completions"
@@ -90,6 +90,7 @@ def _intro_only() -> str:
 def _env(name: str, default: str = "") -> str:
     return (os.getenv(name) or default).strip()
 
+
 SUPABASE_URL = _env("SUPABASE_URL")
 SUPABASE_ANON_KEY = _env("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = _env("SUPABASE_SERVICE_KEY")
@@ -100,10 +101,12 @@ HF_FORCE_MODE = _env("HF_FORCE_MODE", "auto").lower()
 TAVILY_API_KEY = _env("TAVILY_API_KEY")
 INTERNET_MODE = _env("INTERNET_MODE", "off").lower()
 
+
 def _internet_enabled() -> bool:
     if INTERNET_MODE == "off":
         return False
     return bool(TAVILY_API_KEY)
+
 
 def _supabase_clients():
     # Backend should use service key if present; fallback to anon for public-read only.
@@ -114,6 +117,7 @@ def _supabase_clients():
     if SUPABASE_URL and SUPABASE_SERVICE_KEY:
         sb_service = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     return sb_anon, sb_service
+
 
 SB_ANON, SB_SERVICE = _supabase_clients()
 
@@ -161,8 +165,10 @@ class ChatResponse(BaseModel):
 def _clean(text: str) -> str:
     return (text or "").strip()
 
+
 def _lc(text: str) -> str:
     return _clean(text).lower()
+
 
 def _force_hello_prefix(text: str) -> str:
     t = _clean(text)
@@ -172,8 +178,10 @@ def _force_hello_prefix(text: str) -> str:
         return "Hello 👋🏽 " + t
     return t
 
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
 
 def _to_float(x: Any) -> float:
     try:
@@ -184,8 +192,10 @@ def _to_float(x: Any) -> float:
     except Exception:
         return 0.0
 
+
 def _fmt(x: Any) -> str:
     return f"{_to_float(x):,.2f}"
+
 
 def _pct(x: Optional[float]) -> str:
     if x is None:
@@ -195,10 +205,12 @@ def _pct(x: Optional[float]) -> str:
     except Exception:
         return "—"
 
+
 def _ratio(n: Optional[float], d: Optional[float]) -> Optional[float]:
     if n is None or d is None or d == 0:
         return None
     return n / d
+
 
 def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     if df is None or df.empty:
@@ -208,13 +220,16 @@ def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             return c
     return None
 
+
 def _to_num_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(0)
+
 
 def _safe_sum(df: pd.DataFrame, col: Optional[str]) -> float:
     if df is None or df.empty or not col or col not in df.columns:
         return 0.0
     return float(_to_num_series(df[col]).sum())
+
 
 def _db_proof_line(row_counts: Dict[str, int]) -> str:
     ts = _utc_now()
@@ -223,9 +238,11 @@ def _db_proof_line(row_counts: Dict[str, int]) -> str:
     parts = [f"{k}={int(v)}" for k, v in row_counts.items()]
     return f"DB Proof: {', '.join(parts)} • fetched_at={ts}"
 
+
 def _relation_guard(rel: str) -> None:
     if rel not in RELATIONS:
         raise HTTPException(status_code=400, detail=f"Relation not allowed: {rel}")
+
 
 def _sb_select(
     schema: str,
@@ -260,7 +277,6 @@ def _sb_select(
             q = q.order(col, desc=not asc)
         return q
 
-    # Prefer schema; fallback if older supabase-py behavior
     try:
         q = sb.schema(schema).table(relation).select(cols).limit(limit)
         q = _apply(q)
@@ -274,6 +290,7 @@ def _sb_select(
             return pd.DataFrame(getattr(res, "data", None) or [])
         except Exception:
             return pd.DataFrame()
+
 
 def _rpc_finance_snapshot(schema: str) -> Dict[str, Any]:
     """
@@ -300,11 +317,11 @@ def _rpc_finance_snapshot(schema: str) -> Dict[str, Any]:
         return data
     return {}
 
+
 def _snapshot_to_metrics(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if not snapshot:
         return None
 
-    # Nested format
     if isinstance(snapshot.get("totals"), dict) or isinstance(snapshot.get("counts"), dict) or isinstance(snapshot.get("ratios"), dict):
         totals = snapshot.get("totals") or {}
         counts = snapshot.get("counts") or {}
@@ -324,7 +341,6 @@ def _snapshot_to_metrics(snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "liquidity_pressure_ratio": ratios.get("liquidity_pressure_ratio"),
         }
 
-    # Flat format
     rc = snapshot.get("counts") if isinstance(snapshot.get("counts"), dict) else {}
     return {
         "notes": [],
@@ -349,19 +365,24 @@ def _wants_internet(text: str) -> bool:
     t = _lc(text)
     return t.startswith("web:") or t.startswith("internet:") or t.startswith("tavily:")
 
+
 def _strip_web_prefix(q: str) -> str:
     return re.sub(r"^(web:|internet:|tavily:)\s*", "", (q or "").strip(), flags=re.IGNORECASE).strip()
 
+
 def _wants_tables_list(text: str) -> bool:
     return _lc(text) in {"tables", "relations", "views", "list tables", "list views"}
+
 
 def _wants_describe(text: str) -> bool:
     t = _lc(text)
     return t.startswith("describe ") or t.startswith("columns ") or t.startswith("cols ") or t.startswith("schema ")
 
+
 def _wants_show_table(text: str) -> bool:
     t = _lc(text)
     return t.startswith("show ") or t.startswith("preview ") or t.startswith("open ")
+
 
 def _wants_list_members(text: str) -> bool:
     t = _lc(text)
@@ -378,13 +399,16 @@ def _wants_list_members(text: str) -> bool:
     ]
     return t in {"members", "member"} or any(p in t for p in phrases)
 
+
 def _wants_kpis(text: str) -> bool:
     t = _lc(text)
     return any(k in t for k in ["kpi", "kpis", "finance kpi", "finance kpis", "dashboard kpi"])
 
+
 def _wants_loans(text: str) -> bool:
     t = _lc(text)
     return any(k in t for k in ["loan", "loans", "borrow", "repay", "repayment", "overdue", "dpd", "interest due"])
+
 
 def _wants_financial_review(text: str) -> bool:
     t = _lc(text)
@@ -406,15 +430,18 @@ def _wants_financial_review(text: str) -> bool:
     ]
     return any(x in t for x in triggers)
 
+
 def _wants_verify_member(text: str) -> bool:
     t = _lc(text)
     return t.startswith("verify member ") or t.startswith("verify ")
+
 
 def _extract_verify_member_id(text: str) -> Optional[str]:
     t = _lc(text)
     t = re.sub(r"^verify(\s+member)?\s+", "", t).strip()
     m = re.search(r"(\d+)", t)
     return m.group(1) if m else None
+
 
 def _extract_relation_name(text: str) -> Optional[str]:
     t = _lc(text)
@@ -426,11 +453,13 @@ def _extract_relation_name(text: str) -> Optional[str]:
     token = t.split()[0]
     return token if token in RELATIONS else None
 
+
 _MEMBER_ID_PATTERNS = [
     re.compile(r"\bmember[_\s-]?id\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
     re.compile(r"\bmember\s*#?\s*(\d+)\b", re.IGNORECASE),
     re.compile(r"\bid\s*[:=#]?\s*(\d+)\b", re.IGNORECASE),
 ]
+
 
 def _extract_member_id(text: str) -> Optional[str]:
     t = _clean(text)
@@ -443,6 +472,7 @@ def _extract_member_id(text: str) -> Optional[str]:
         if m:
             return str(m.group(1))
     return None
+
 
 def _is_db_command(text: str) -> bool:
     t = _lc(text)
@@ -503,6 +533,7 @@ def _load_members_truth(schema: str, limit: int = 3000) -> pd.DataFrame:
 
     return out
 
+
 def _member_name_from_truth(members_truth: pd.DataFrame, member_id: str) -> str:
     if members_truth is None or members_truth.empty:
         return "(unknown)"
@@ -510,6 +541,7 @@ def _member_name_from_truth(members_truth: pd.DataFrame, member_id: str) -> str:
     if hit.empty:
         return "(unknown)"
     return str(hit.iloc[0]["member_name"])
+
 
 def _member_exists(members_truth: pd.DataFrame, member_id: str) -> bool:
     if members_truth is None or members_truth.empty:
@@ -530,6 +562,7 @@ def _active_loan_filter(loans: pd.DataFrame) -> pd.DataFrame:
     active_status = {"active", "open", "ongoing", "overdue", "late", "running", "disbursed"}
     return loans[s.isin(active_status)]
 
+
 def _overdue_loan_filter(loans: pd.DataFrame) -> pd.DataFrame:
     if loans is None or loans.empty:
         return loans
@@ -543,12 +576,15 @@ def _overdue_loan_filter(loans: pd.DataFrame) -> pd.DataFrame:
         return loans[dpd > 0]
     return loans.iloc[0:0]
 
+
 def _loan_balance_col(loans: pd.DataFrame) -> Optional[str]:
     # ✅ your schema uses principal_current
     return _pick_col(loans, ["principal_current", "outstanding_principal", "principal_remaining", "principal", "amount"])
 
+
 def _unpaid_interest_col(loans: pd.DataFrame) -> Optional[str]:
     return _pick_col(loans, ["unpaid_interest", "interest_unpaid", "interest_due", "interest_balance"])
+
 
 def _member_risk_grade(active_bal: float, unpaid: float) -> str:
     if active_bal <= 0 and unpaid <= 0:
@@ -556,6 +592,7 @@ def _member_risk_grade(active_bal: float, unpaid: float) -> str:
     if active_bal > 0 and unpaid <= 0:
         return "B"
     return "C"
+
 
 def _compute_member_totals_from_tables(schema: str, member_id: str) -> Tuple[Dict[str, Any], List[str]]:
     notes: List[str] = []
@@ -605,13 +642,14 @@ def _compute_member_totals_from_tables(schema: str, member_id: str) -> Tuple[Dic
     }
     return out, notes
 
+
 def _collect_global_finance(schema: str) -> Dict[str, Any]:
     # Snapshot-first
     snap = _rpc_finance_snapshot(schema)
     if snap:
         return {"ok": True, "notes": [], "snapshot": snap}
 
-    # Fallback: view (if exists)
+    # Fallback compute
     ctx: Dict[str, Any] = {"ok": True, "notes": ["Snapshot unavailable → fallback compute."], "df": {}}
     if "v_finance_kpis" in RELATIONS:
         ctx["df"]["v_finance_kpis"] = _sb_select(schema, "v_finance_kpis", cols="*", limit=200)
@@ -621,6 +659,7 @@ def _collect_global_finance(schema: str) -> Dict[str, Any]:
     ctx["df"]["interest_ledger"] = _sb_select(schema, "interest_ledger", cols="*", limit=200000)
     ctx["df"]["fines"] = _sb_select(schema, "fines", cols="*", limit=200000)
     return ctx
+
 
 def _compute_global_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
     snap = ctx.get("snapshot") or {}
@@ -686,6 +725,7 @@ def _compute_global_metrics(ctx: Dict[str, Any]) -> Dict[str, Any]:
         "liquidity_pressure_ratio": liquidity_pressure,
     }
 
+
 def _risk_classification(metrics: Dict[str, Any]) -> Tuple[str, List[str]]:
     signals: List[str] = []
     lpr = metrics.get("liquidity_pressure_ratio")
@@ -714,6 +754,7 @@ def _risk_classification(metrics: Dict[str, Any]) -> Tuple[str, List[str]]:
     if score >= 1:
         return "Moderate", signals
     return "Low", signals
+
 
 def _build_control_tower_report(metrics: Dict[str, Any]) -> str:
     risk_label, signals = _risk_classification(metrics)
@@ -801,6 +842,7 @@ def _post_with_retries(url: str, headers: dict, payload: dict, timeout: int = 60
             time.sleep(1.0 + attempt * 1.5)
     return False, last_err or "HF transient error"
 
+
 def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
     out: List[str] = []
     for m in messages:
@@ -815,6 +857,7 @@ def _messages_to_prompt(messages: List[Dict[str, str]]) -> str:
     out.append("[ASSISTANT]\n")
     return "\n".join(out)
 
+
 def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": 650}
@@ -827,6 +870,7 @@ def _hf_router_chat(model: str, token: str, messages: List[Dict[str, str]], time
         return True, str(text).strip()
     except Exception:
         return False, f"Bad HF chat response: {raw[:600]}"
+
 
 def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 60) -> Tuple[bool, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -841,6 +885,7 @@ def _hf_router_completions(model: str, token: str, prompt: str, timeout: int = 6
     except Exception:
         return False, f"Bad HF completions response: {raw[:600]}"
 
+
 def _younchat_hf_system_prompt() -> str:
     return (
         "You are younchat — the Autonomous Financial Intelligence Engine for the Njangi platform \"theyoungshallgrow\".\n"
@@ -853,6 +898,7 @@ def _younchat_hf_system_prompt() -> str:
         "Style: professional, analytical, bullet-structured. Start with Hello.\n"
     )
 
+
 def _looks_like_code_output(txt: str) -> bool:
     t = (txt or "").strip().lower()
     if not t:
@@ -861,6 +907,7 @@ def _looks_like_code_output(txt: str) -> bool:
         return True
     code_markers = ["import ", "def ", "class ", "select ", "create table", "alter table", "drop table"]
     return any(m in t for m in code_markers)
+
 
 def _hf_call(token: str, messages: List[Dict[str, str]]) -> Tuple[bool, str, str, str]:
     force = (HF_FORCE_MODE or "auto").strip().lower()
@@ -915,11 +962,8 @@ def _df_payload(title: str, df: pd.DataFrame, limit: int = 200) -> Dict[str, Any
         return {"title": title, "columns": [], "rows": []}
     if len(df) > limit:
         df = df.head(limit)
-    return {
-        "title": title,
-        "columns": list(df.columns),
-        "rows": df.to_dict(orient="records"),
-    }
+    return {"title": title, "columns": list(df.columns), "rows": df.to_dict(orient="records")}
+
 
 def _member_report_tables_only(schema: str, member_id: str, members_truth: pd.DataFrame) -> str:
     if not _member_exists(members_truth, member_id):
@@ -959,7 +1003,10 @@ def _member_report_tables_only(schema: str, member_id: str, members_truth: pd.Da
 
     return "\n".join(lines)
 
-def _handle_db_commands(schema: str, q: str, last_member_id: Optional[str]) -> Tuple[str, str, Optional[str], Optional[Dict[str, Any]]]:
+
+def _handle_db_commands(
+    schema: str, q: str, last_member_id: Optional[str]
+) -> Tuple[str, str, Optional[str], Optional[Dict[str, Any]]]:
     """
     Returns: reply, used_source, member_id_focus, dataframe_payload
     """
@@ -1014,7 +1061,6 @@ def _handle_db_commands(schema: str, q: str, last_member_id: Optional[str]) -> T
     if _wants_list_members(q):
         if members_truth is None or members_truth.empty:
             return "Hello 👋🏽 I couldn’t read **members** (source of truth). Check RLS/permissions.", "members:error", last_member_id, None
-        # Keep it readable
         lines = ["Hello 👋🏽 Here are all members (from `members`):\n"]
         for r in members_truth.itertuples(index=False):
             lines.append(f"- **{r.member_id}** • {r.member_name}")
@@ -1051,12 +1097,11 @@ def _handle_db_commands(schema: str, q: str, last_member_id: Optional[str]) -> T
         metrics = _compute_global_metrics(ctx)
         return _build_control_tower_report(metrics), "finance_intel", last_member_id, None
 
-    # Verify member (simple: tables-only report; you can extend to compare view vs tables later)
+    # Verify member
     if _wants_verify_member(q):
         mid = _extract_verify_member_id(q) or last_member_id
         if not mid:
             return "Hello 👋🏽 Say: **verify member 10**", "verify:help", last_member_id, None
-        # For Flutter: keep it tight
         return _member_report_tables_only(schema, str(mid), members_truth), "verify:tables", str(mid), None
 
     # Member report when user just types a number
@@ -1070,7 +1115,6 @@ def _handle_db_commands(schema: str, q: str, last_member_id: Optional[str]) -> T
         df = _sb_select(schema, rel, cols="*", limit=2000)
         return f"Hello 👋🏽 Preview of **{rel}**:", f"show:{rel}", last_member_id, _df_payload(f"Preview: {rel}", df)
 
-    # If it smells like DB but didn't match a command
     return (
         "Hello 👋🏽 I can answer using your real Njangi database only.\n\n"
         "Try:\n"
@@ -1103,9 +1147,11 @@ def health():
         "schema_default": DEFAULT_SCHEMA,
     }
 
+
 @app.get("/relations")
 def relations():
     return [{"relation": k, "type": RELATIONS[k].get("type")} for k in sorted(RELATIONS.keys())]
+
 
 @app.get("/describe/{relation}")
 def describe(relation: str, schema: str = DEFAULT_SCHEMA):
@@ -1113,12 +1159,14 @@ def describe(relation: str, schema: str = DEFAULT_SCHEMA):
     df = _sb_select(schema, relation, cols="*", limit=1)
     return {"relation": relation, "type": RELATIONS[relation]["type"], "columns": list(df.columns)}
 
+
 @app.get("/preview/{relation}")
 def preview(relation: str, schema: str = DEFAULT_SCHEMA, limit: int = 50):
     _relation_guard(relation)
     limit = max(1, min(int(limit), 2000))
     df = _sb_select(schema, relation, cols="*", limit=limit)
     return _df_payload(f"Preview: {relation}", df, limit=limit)
+
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
@@ -1129,7 +1177,6 @@ def chat(req: ChatRequest):
     schema = (req.schema or DEFAULT_SCHEMA).strip() or DEFAULT_SCHEMA
     last_member_id = _clean(req.last_member_id or "") or None
 
-    # Update focus from message if it contains a member id
     detected = _extract_member_id(q)
     if detected:
         last_member_id = detected
@@ -1150,11 +1197,10 @@ def chat(req: ChatRequest):
             },
         )
 
-    # 2) If not a DB command, use HF foundation model for wording (optional)
+    # 2) Non-DB → HF foundation model for wording (optional)
     if HF_TOKEN:
         system = _younchat_hf_system_prompt()
 
-        # build a short context from client history
         history = req.history or []
         trimmed = history[-10:] if len(history) > 10 else history
 
@@ -1164,8 +1210,6 @@ def chat(req: ChatRequest):
             content = m.get("content", "")
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
-
-        # include current message
         messages.append({"role": "user", "content": q})
 
         ok, txt, mode, model_used = _hf_call(HF_TOKEN, messages)
