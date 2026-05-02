@@ -151,10 +151,28 @@ def _internet_enabled() -> bool:
 # =============================================================================
 
 _SUPABASE_INIT_ERROR = ""
+_SUPABASE_SECRET_REST_MODE = False
+
+
+def _is_supabase_secret_key(key: Optional[str]) -> bool:
+    """Return True for new Supabase secret keys such as sb_secret_..."""
+    return _clean_env_value(key).startswith("sb_secret_")
 
 
 def _supabase_clients():
-    global _SUPABASE_INIT_ERROR
+    """
+    Initialize Supabase clients.
+
+    Important:
+    - Legacy JWT keys such as anon/service_role can use supabase-py create_client().
+    - New Supabase secret keys start with sb_secret_... and are not JWT-based.
+      supabase-py may reject them with "Invalid API key" during client setup.
+      For sb_secret_..., this app uses direct Supabase REST calls instead.
+    """
+    global _SUPABASE_INIT_ERROR, _SUPABASE_SECRET_REST_MODE
+
+    _SUPABASE_INIT_ERROR = ""
+    _SUPABASE_SECRET_REST_MODE = False
 
     url = _clean_env_value(SUPABASE_URL)
     anon = _clean_env_value(SUPABASE_ANON_KEY)
@@ -174,14 +192,20 @@ def _supabase_clients():
             _SUPABASE_INIT_ERROR = f"Anon key error: {e}"
 
     if service:
-        try:
-            sb_service = create_client(url, service)
-        except Exception as e:
-            if _SUPABASE_INIT_ERROR:
-                _SUPABASE_INIT_ERROR += f" | Service key error: {e}"
-            else:
-                _SUPABASE_INIT_ERROR = f"Service key error: {e}"
-            sb_service = None
+        if _is_supabase_secret_key(service):
+            # New Supabase secret keys are used through REST headers.
+            # Do not pass sb_secret_... into create_client().
+            _SUPABASE_SECRET_REST_MODE = True
+        else:
+            # Legacy service_role JWT key path.
+            try:
+                sb_service = create_client(url, service)
+            except Exception as e:
+                if _SUPABASE_INIT_ERROR:
+                    _SUPABASE_INIT_ERROR += f" | Service key error: {e}"
+                else:
+                    _SUPABASE_INIT_ERROR = f"Service key error: {e}"
+                sb_service = None
 
     return sb_anon, sb_service
 
@@ -202,7 +226,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -390,6 +414,110 @@ def _get_supabase_client():
     return SB_SERVICE or SB_ANON
 
 
+def _supabase_rest_key() -> str:
+    """Prefer the backend secret key; fall back to anon for public reads."""
+    service = _clean_env_value(SUPABASE_SERVICE_KEY)
+    anon = _clean_env_value(SUPABASE_ANON_KEY)
+    return service or anon
+
+
+def _use_supabase_rest_secret() -> bool:
+    return bool(_clean_env_value(SUPABASE_URL)) and _is_supabase_secret_key(SUPABASE_SERVICE_KEY)
+
+
+def _supabase_rest_headers(schema: Optional[str] = None, write: bool = False) -> Dict[str, str]:
+    """
+    Headers for Supabase REST API.
+
+    New Supabase secret keys are not JWTs. For sb_secret_... keys, do not send
+    Authorization: Bearer. Send the key through the apikey header only.
+    """
+    key = _supabase_rest_key()
+    headers: Dict[str, str] = {
+        "apikey": key,
+        "Accept": "application/json",
+        "User-Agent": "theyoungshallgrow-api-server",
+    }
+
+    if write:
+        headers["Content-Type"] = "application/json"
+
+    clean_schema = (schema or DEFAULT_SCHEMA or "public").strip()
+    if clean_schema and clean_schema != "public":
+        headers["Accept-Profile"] = clean_schema
+        if write:
+            headers["Content-Profile"] = clean_schema
+
+    return headers
+
+
+def _rest_filter_value(op: str, val: Any) -> str:
+    if op == "in" and isinstance(val, (list, tuple, set)):
+        cleaned = []
+        for item in val:
+            s = str(item).strip()
+            if "," in s or " " in s:
+                s = '"' + s.replace('"', '\\"') + '"'
+            cleaned.append(s)
+        return "in.(" + ",".join(cleaned) + ")"
+
+    if op == "ilike":
+        s = str(val)
+        if "*" not in s and "%" not in s:
+            s = f"*{s}*"
+        return f"ilike.{s}"
+
+    return f"{op}.{val}"
+
+
+def _sb_select_rest(
+    schema: str,
+    relation: str,
+    cols: str = "*",
+    limit: int = 2000,
+    filters: Optional[List[Tuple[str, str, Any]]] = None,
+    order: Optional[Tuple[str, bool]] = None,
+) -> pd.DataFrame:
+    url = _clean_env_value(SUPABASE_URL).rstrip("/")
+    key = _supabase_rest_key()
+
+    if not url or not key:
+        return pd.DataFrame()
+
+    endpoint = f"{url}/rest/v1/{relation}"
+    params: Dict[str, Any] = {
+        "select": cols,
+        "limit": str(max(1, min(int(limit), MAX_DB_ROWS))),
+    }
+
+    if filters:
+        for col, op, val in filters:
+            if val is None:
+                continue
+            params[col] = _rest_filter_value(op, val)
+
+    if order:
+        col, asc = order
+        params["order"] = f"{col}.{'asc' if asc else 'desc'}"
+
+    try:
+        r = requests.get(
+            endpoint,
+            headers=_supabase_rest_headers(schema=schema, write=False),
+            params=params,
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return pd.DataFrame(data)
+        if isinstance(data, dict):
+            return pd.DataFrame([data])
+        return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
 def _sb_select(
     schema: str,
     relation: str,
@@ -400,11 +528,22 @@ def _sb_select(
 ) -> pd.DataFrame:
     _relation_guard(relation)
 
+    limit = max(1, min(int(limit), MAX_DB_ROWS))
+
+    # New Supabase secret keys: use direct REST instead of supabase-py.
+    if _use_supabase_rest_secret():
+        return _sb_select_rest(
+            schema=schema,
+            relation=relation,
+            cols=cols,
+            limit=limit,
+            filters=filters,
+            order=order,
+        )
+
     sb = _get_supabase_client()
     if sb is None:
         return pd.DataFrame()
-
-    limit = max(1, min(int(limit), MAX_DB_ROWS))
 
     def _apply(q):
         if filters:
@@ -441,7 +580,43 @@ def _sb_select(
             return pd.DataFrame()
 
 
+def _rpc_finance_snapshot_rest(schema: str) -> Dict[str, Any]:
+    url = _clean_env_value(SUPABASE_URL).rstrip("/")
+    key = _supabase_rest_key()
+
+    if not url or not key:
+        return {}
+
+    endpoint = f"{url}/rest/v1/rpc/fn_finance_snapshot"
+
+    try:
+        r = requests.post(
+            endpoint,
+            headers=_supabase_rest_headers(schema=schema, write=True),
+            json={},
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return {}
+
+    if not data:
+        return {}
+
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+
+    if isinstance(data, dict):
+        return data
+
+    return {}
+
+
 def _rpc_finance_snapshot(schema: str) -> Dict[str, Any]:
+    if _use_supabase_rest_secret():
+        return _rpc_finance_snapshot_rest(schema)
+
     sb = _get_supabase_client()
     if sb is None:
         return {}
@@ -466,6 +641,7 @@ def _rpc_finance_snapshot(schema: str) -> Dict[str, Any]:
         return data
 
     return {}
+
 
 
 def _df_payload(title: str, df: pd.DataFrame, limit: int = 200) -> Dict[str, Any]:
@@ -3125,6 +3301,8 @@ def health():
         "supabase_url_set": bool(_clean_env_value(SUPABASE_URL)),
         "supabase_anon_set": bool(_clean_env_value(SUPABASE_ANON_KEY)),
         "supabase_service_set": bool(_clean_env_value(SUPABASE_SERVICE_KEY)),
+        "supabase_secret_key_mode": "REST" if _use_supabase_rest_secret() else "supabase-py",
+        "supabase_secret_key_format": "sb_secret" if _is_supabase_secret_key(SUPABASE_SERVICE_KEY) else "legacy_or_empty",
         "supabase_init_error": _SUPABASE_INIT_ERROR or None,
         "hf_token_set": bool(HF_TOKEN),
         "hf_models_locked": HF_ALLOWED_MODELS,
