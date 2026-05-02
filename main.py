@@ -2991,9 +2991,14 @@ def _transformer_general_response(
     reply, used_source, meta = _call_general_transformer_ai(
         q=q,
         history=history,
-        preferred_model=
+        preferred_model=preferred_model,
+        safe_mode=safe_mode,
+    )
 
-        # =============================================================================
+    return reply, used_source, None, meta
+
+
+# =============================================================================
 # PART 5/5
 # DB Intent Handler + FastAPI Routes
 # Paste this directly under Part 4.
@@ -3251,9 +3256,3 @@ def chat(req: ChatRequest):
 # pip install fastapi uvicorn pandas requests supabase pydantic
 # uvicorn main:app --reload --host 0.0.0.0 --port 8000
 # =============================================================================
-
-
-
-
-
-
