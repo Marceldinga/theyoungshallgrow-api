@@ -886,7 +886,14 @@ class AdvancedTransformerRouter:
 
     def route(self, ctx: TransformerContext) -> TransformerIntent:
         text = ctx.normalized
-        member_id = _extract_member_id(text) or ctx.last_member_id
+
+        # IMPORTANT:
+        # Only an ID explicitly typed in the CURRENT message should trigger
+        # MEMBER_REPORT routing. Do not let ctx.last_member_id turn normal
+        # questions like "how are you" or "explain this" into another
+        # member financial report.
+        explicit_member_id = _extract_member_id(text)
+        member_id = explicit_member_id
         relation = _extract_relation_name(text)
 
         if _starts_with_any(text, ["web:", "internet:", "tavily:"]):
@@ -1007,16 +1014,16 @@ class AdvancedTransformerRouter:
                 )
             )
 
-        if member_id and not text.isdigit():
+        if explicit_member_id and not text.isdigit():
             candidates.append(
                 TransformerIntent(
                     intent=IntentType.MEMBER_REPORT,
                     confidence=0.82,
-                    member_id=member_id,
+                    member_id=explicit_member_id,
                     relation=relation,
                     requires_db=True,
                     requires_web=False,
-                    reason="Member ID detected.",
+                    reason="Explicit member ID detected in current message.",
                 )
             )
 
@@ -3154,6 +3161,10 @@ def _is_small_talk(text: str) -> bool:
         "good morning",
         "good afternoon",
         "good evening",
+        "how are you",
+        "how are you?",
+        "how are you doing",
+        "how are you doing?",
         "thanks",
         "thank you",
         "ok",
@@ -3165,9 +3176,127 @@ def _small_talk_reply(text: str) -> str:
     t = _lc(text)
 
     if t in {"thanks", "thank you"}:
-        return "Hello 👋🏽 You’re welcome."
+        return "Hello, you’re welcome."
 
-    return _intro_only()
+    if t in {"how are you", "how are you?", "how are you doing", "how are you doing?"}:
+        return (
+            "Hello, I’m doing well and ready to help you manage your Njangi platform. "
+            "You can ask for members, loans, contributions, finance KPIs, or type a member ID."
+        )
+
+    return "Hello, I’m younchat — your Njangi assistant."
+
+
+def _is_explain_previous_request(text: str) -> bool:
+    t = _lc(text)
+    explain_terms = [
+        "explain",
+        "explain the result",
+        "explain the results",
+        "explain this",
+        "what does this mean",
+        "meaning of this",
+        "interpret this",
+        "interpret the result",
+        "interpret the results",
+    ]
+    return any(term in t for term in explain_terms)
+
+
+def _clean_reply_for_ui(text: str) -> str:
+    """Return plain text that displays cleanly in Flutter Text widgets."""
+    t = text or ""
+    replacements = {
+        "**": "",
+        "`": "",
+        "1️⃣": "1.",
+        "2️⃣": "2.",
+        "3️⃣": "3.",
+        "4️⃣": "4.",
+        "5️⃣": "5.",
+        "6️⃣": "6.",
+        "🧾": "DB Proof:",
+        "🔒": "Data note:",
+        "👋🏽": "",
+        "👋": "",
+    }
+    for old, new in replacements.items():
+        t = t.replace(old, new)
+    t = re.sub(r"[ \t]+\n", "\n", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+def _explain_member_financial_results(
+    schema: str,
+    member_id: str,
+    members_truth: pd.DataFrame,
+) -> str:
+    if not member_id:
+        return (
+            "Hello, I can explain a member result after you type a member ID first. "
+            "Example: type 10, then ask: explain the results."
+        )
+
+    if not _member_exists(members_truth, str(member_id)):
+        return "Hello, I cannot confirm that member_id exists in members. Type members to verify IDs."
+
+    name = _member_name_from_truth(members_truth, str(member_id))
+    totals, notes = _compute_member_totals_from_tables(schema, str(member_id))
+
+    contributions_total = _to_float(totals.get("contributions_total"))
+    foundation_total = _to_float(totals.get("foundation_total"))
+    fines_total = _to_float(totals.get("fines_total"))
+    active_loan_balance = _to_float(totals.get("active_loan_balance"))
+    active_unpaid_interest = _to_float(totals.get("active_unpaid_interest"))
+    interest_total = _to_float(totals.get("interest_total"))
+    grade = _member_risk_grade(active_loan_balance, active_unpaid_interest)
+
+    lines: List[str] = []
+    lines.append("Hello, here is the meaning of the member financial result.\n")
+    lines.append(f"Member: {name} (member_id={member_id})")
+    lines.append(f"Contributions total: {_fmt(contributions_total)}")
+    lines.append("This is the total regular Njangi contribution recorded for this member.")
+    lines.append("")
+    lines.append(f"Foundation total: {_fmt(foundation_total)}")
+    lines.append("This is the member’s foundation/reserve contribution used to support the group fund.")
+    lines.append("")
+    lines.append(f"Fines total: {_fmt(fines_total)}")
+    lines.append("This shows penalties recorded for the member. A value of 0.00 means no fines were found.")
+    lines.append("")
+    lines.append(f"Active loan balance: {_fmt(active_loan_balance)}")
+    if active_loan_balance > 0:
+        lines.append("This means the member currently has loan exposure that still needs to be repaid.")
+    else:
+        lines.append("This means no active loan balance was detected for this member.")
+    lines.append("")
+    lines.append(f"Active unpaid interest: {_fmt(active_unpaid_interest)}")
+    if active_unpaid_interest > 0:
+        lines.append("This means interest is currently unpaid and should be monitored.")
+    else:
+        lines.append("This means no unpaid interest was detected on the active loan.")
+    lines.append("")
+    lines.append(f"Interest ledger total: {_fmt(interest_total)}")
+    lines.append("This is the total interest recorded historically in the interest ledger for this member.")
+    lines.append("")
+    lines.append(f"Risk grade: {grade}")
+    if grade == "A":
+        lines.append("Interpretation: Low risk. The member has no active loan balance and no unpaid interest.")
+    elif grade == "B":
+        lines.append("Interpretation: Moderate risk. The member has an active loan balance, but no unpaid interest was detected.")
+    else:
+        lines.append("Interpretation: Higher risk. The member has active loan exposure and unpaid interest.")
+    lines.append("")
+    lines.append("Action: keep monitoring repayment status, interest records, and future contributions for this member.")
+    lines.append("")
+    lines.append(_db_proof_line(totals.get("_rows", {})))
+
+    if notes:
+        lines.append("\nData notes:")
+        for note in notes:
+            lines.append(f"- {note}")
+
+    return "\n".join(lines)
 
 
 def _model_choice_is_allowed(model: Optional[str]) -> Optional[str]:
@@ -3386,7 +3515,7 @@ def chat(req: ChatRequest):
 
     if _prompt_injection_detected(q):
         return ChatResponse(
-            reply=_prompt_guard_reply(),
+            reply=_clean_reply_for_ui(_prompt_guard_reply()),
             used_source="safety:prompt_guard",
             member_id_focus=req.last_member_id,
             dataframe=None,
@@ -3401,6 +3530,30 @@ def chat(req: ChatRequest):
         last_member_id = detected
 
     history = _normalize_history(req.history)
+
+    # Handle simple conversation before the DB router. This prevents a saved
+    # last_member_id from turning normal chat into another member report.
+    if _is_small_talk(q):
+        return ChatResponse(
+            reply=_clean_reply_for_ui(_small_talk_reply(q)),
+            used_source="local:smalltalk",
+            member_id_focus=last_member_id,
+            dataframe=None,
+            meta={"schema": schema, "smalltalk": True},
+        )
+
+    # Explain the last member report in plain English instead of re-printing
+    # the same financial report.
+    if _is_explain_previous_request(q):
+        members_truth = _load_members_truth(schema=schema, limit=3000)
+        reply = _explain_member_financial_results(schema, last_member_id or "", members_truth)
+        return ChatResponse(
+            reply=_clean_reply_for_ui(reply),
+            used_source="member:explanation",
+            member_id_focus=last_member_id,
+            dataframe=None,
+            meta={"schema": schema, "intent": "explain_results", "member_id": last_member_id},
+        )
 
     ctx = TransformerContext(
         schema=schema,
@@ -3417,7 +3570,7 @@ def chat(req: ChatRequest):
     if intent.requires_web or intent.intent == IntentType.INTERNET:
         reply, used_source, member_focus, df = _build_web_reply(q, last_member_id)
         return ChatResponse(
-            reply=_force_hello_prefix(reply),
+            reply=_clean_reply_for_ui(_force_hello_prefix(reply)),
             used_source=used_source,
             member_id_focus=member_focus,
             dataframe=df,
@@ -3439,7 +3592,7 @@ def chat(req: ChatRequest):
         )
 
         return ChatResponse(
-            reply=_force_hello_prefix(reply),
+            reply=_clean_reply_for_ui(_force_hello_prefix(reply)),
             used_source=used_source,
             member_id_focus=member_focus,
             dataframe=df,
@@ -3460,7 +3613,7 @@ def chat(req: ChatRequest):
     )
 
     return ChatResponse(
-        reply=_force_hello_prefix(reply),
+        reply=_clean_reply_for_ui(_force_hello_prefix(reply)),
         used_source=used_source,
         member_id_focus=last_member_id,
         dataframe=df,
