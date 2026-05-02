@@ -141,6 +141,15 @@ HF_FORCE_MODE = _env("HF_FORCE_MODE", "auto").lower()
 TAVILY_API_KEY = _env("TAVILY_API_KEY")
 INTERNET_MODE = _env("INTERNET_MODE", "off").lower()
 
+# Fast response / advanced reasoning controls
+FAST_MODE = _env("FAST_MODE", "on").lower() not in {"0", "false", "off", "no"}
+HF_TIMEOUT_SECONDS = int(_env("HF_TIMEOUT_SECONDS", "12") or "12")
+HF_MAX_RETRIES = int(_env("HF_MAX_RETRIES", "1") or "1")
+HF_MODEL_PRIMARY = _env("HF_MODEL_PRIMARY", HF_ALLOWED_MODELS[0])
+HF_MODEL_FALLBACKS_RAW = _env("HF_MODEL_FALLBACKS", ",".join(HF_ALLOWED_MODELS[1:]))
+HF_MODEL_FALLBACKS = [m.strip() for m in HF_MODEL_FALLBACKS_RAW.split(",") if m.strip()]
+GENERAL_CACHE_TTL_SECONDS = int(_env("GENERAL_CACHE_TTL_SECONDS", "300") or "300")
+
 
 def _internet_enabled() -> bool:
     return INTERNET_MODE != "off" and bool(TAVILY_API_KEY)
@@ -2606,12 +2615,13 @@ def _post_with_retries(
     url: str,
     headers: dict,
     payload: dict,
-    timeout: int = 60,
+    timeout: int = HF_TIMEOUT_SECONDS,
 ) -> Tuple[bool, str]:
 
     last_err = ""
+    attempts = max(1, HF_MAX_RETRIES + 1)
 
-    for attempt in range(4):
+    for attempt in range(attempts):
         try:
             r = requests.post(
                 url,
@@ -2621,18 +2631,21 @@ def _post_with_retries(
             )
 
             if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HF error {r.status_code}: {r.text[:600]}"
-                time.sleep(1.0 + attempt * 1.5)
-                continue
+                last_err = f"HF error {r.status_code}: {r.text[:400]}"
+                if attempt < attempts - 1:
+                    time.sleep(0.35 + attempt * 0.35)
+                    continue
+                return False, last_err
 
             if r.status_code >= 400:
-                return False, f"HF error {r.status_code}: {r.text[:600]}"
+                return False, f"HF error {r.status_code}: {r.text[:400]}"
 
             return True, r.text
 
         except Exception as e:
             last_err = str(e)
-            time.sleep(1.0 + attempt * 1.5)
+            if attempt < attempts - 1:
+                time.sleep(0.35 + attempt * 0.35)
 
     return False, last_err or "HF transient error"
 
@@ -2704,7 +2717,7 @@ def _hf_router_chat(
     model: str,
     token: str,
     messages: List[Dict[str, str]],
-    timeout: int = 60,
+    timeout: int = HF_TIMEOUT_SECONDS,
 ) -> Tuple[bool, str]:
 
     headers = {
@@ -2745,7 +2758,7 @@ def _hf_router_completions(
     model: str,
     token: str,
     prompt: str,
-    timeout: int = 60,
+    timeout: int = HF_TIMEOUT_SECONDS,
 ) -> Tuple[bool, str]:
 
     headers = {
@@ -2847,41 +2860,29 @@ def _hf_call(
     force = (HF_FORCE_MODE or "auto").strip().lower()
     prompt = _messages_to_prompt(messages)
 
+    configured_order: List[str] = []
+
     if preferred_model and preferred_model in HF_ALLOWED_MODELS:
-        model_order = [preferred_model] + [
-            m for m in HF_ALLOWED_MODELS if m != preferred_model
-        ]
-    else:
-        model_order = list(HF_ALLOWED_MODELS)
+        configured_order.append(preferred_model)
+
+    if HF_MODEL_PRIMARY in HF_ALLOWED_MODELS and HF_MODEL_PRIMARY not in configured_order:
+        configured_order.append(HF_MODEL_PRIMARY)
+
+    for m in HF_MODEL_FALLBACKS + HF_ALLOWED_MODELS:
+        if m in HF_ALLOWED_MODELS and m not in configured_order:
+            configured_order.append(m)
+
+    model_order = configured_order or list(HF_ALLOWED_MODELS)
 
     def _looks_instruct(model_name: str) -> bool:
         m = (model_name or "").lower()
-        return any(
-            x in m
-            for x in [
-                "instruct",
-                "mistral",
-                "llama-3",
-                "llama-3.1",
-            ]
-        )
+        return any(x in m for x in ["instruct", "mistral", "llama-3", "llama-3.1"])
 
     def _should_try_next(err_text: str) -> bool:
         e = (err_text or "").lower()
         return any(
             s in e
-            for s in [
-                "404",
-                "not found",
-                "429",
-                "500",
-                "502",
-                "503",
-                "504",
-                "timeout",
-                "server error",
-                "not supported",
-            ]
+            for s in ["404", "not found", "429", "500", "502", "503", "504", "timeout", "server error", "not supported"]
         )
 
     last_err = ""
@@ -2893,40 +2894,29 @@ def _hf_call(
 
         if force == "chat":
             order = ["chat"]
-
         elif force == "completions":
             order = ["completions"]
-
+        elif FAST_MODE:
+            # Fast mode avoids trying multiple API styles for each model.
+            # Chat is most natural for instruction models and usually returns faster.
+            order = ["chat"]
         else:
-            order = (
-                ["completions", "chat"]
-                if _looks_instruct(chosen)
-                else ["chat", "completions"]
-            )
+            order = ["completions", "chat"] if _looks_instruct(chosen) else ["chat", "completions"]
 
         for mode in order:
             last_mode = mode
 
             if mode == "completions":
-                ok, txt = _hf_router_completions(
-                    chosen,
-                    token,
-                    prompt,
-                )
-
+                ok, txt = _hf_router_completions(chosen, token, prompt, timeout=HF_TIMEOUT_SECONDS)
             else:
-                ok, txt = _hf_router_chat(
-                    chosen,
-                    token,
-                    messages,
-                )
+                ok, txt = _hf_router_chat(chosen, token, messages, timeout=HF_TIMEOUT_SECONDS)
 
             if ok and txt:
                 return True, txt, mode, chosen
 
             last_err = txt
 
-        if not _should_try_next(last_err):
+        if FAST_MODE or not _should_try_next(last_err):
             break
 
     return False, last_err or "Unknown HF error", last_mode, last_model
@@ -3057,6 +3047,139 @@ def _sanitize_model_output(
     return _force_hello_prefix(cleaned), "ok"
 
 
+# =============================================================================
+# FAST LOCAL REASONING + CACHE
+# =============================================================================
+
+_GENERAL_RESPONSE_CACHE: Dict[str, Tuple[float, str, str, Dict[str, Any]]] = {}
+
+
+def _cache_key(q: str, history: List[Dict[str, str]], model: Optional[str]) -> str:
+    compact_history = json.dumps(_safe_history_for_model(history)[-4:], sort_keys=True)
+    return _hash_text(f"{model or ''}|{q}|{compact_history}")
+
+
+def _cache_get(key: str) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+    item = _GENERAL_RESPONSE_CACHE.get(key)
+    if not item:
+        return None
+    ts, reply, used_source, meta = item
+    if time.time() - ts > GENERAL_CACHE_TTL_SECONDS:
+        _GENERAL_RESPONSE_CACHE.pop(key, None)
+        return None
+    return reply, used_source, {**meta, "cache_hit": True}
+
+
+def _cache_set(key: str, reply: str, used_source: str, meta: Dict[str, Any]) -> None:
+    if len(_GENERAL_RESPONSE_CACHE) > 200:
+        # Simple memory protection for Railway.
+        for k in list(_GENERAL_RESPONSE_CACHE.keys())[:50]:
+            _GENERAL_RESPONSE_CACHE.pop(k, None)
+    _GENERAL_RESPONSE_CACHE[key] = (time.time(), reply, used_source, dict(meta or {}))
+
+
+def _is_capability_request(text: str) -> bool:
+    t = _lc(text)
+    return any(
+        p in t
+        for p in [
+            "what can you do",
+            "what do you do",
+            "what do you have for me",
+            "what do you have for me today",
+            "help me",
+            "help",
+            "menu",
+            "features",
+            "commands",
+            "options",
+        ]
+    )
+
+
+def _capability_reply(last_member_id: Optional[str] = None) -> str:
+    focus = f" Current member focus is {last_member_id}." if last_member_id else ""
+    return (
+        "Hello, I can help you manage the Njangi platform quickly.\n\n"
+        "Fast commands you can use:\n"
+        "- members: list all members\n"
+        "- type a member ID, for example 10: get that member’s financial report\n"
+        "- explain the results: explain the last member report in simple English\n"
+        "- loans: review loan exposure and repayment risk\n"
+        "- contributions: review contribution totals\n"
+        "- foundation: review foundation reserve strength\n"
+        "- finance kpis or how are we doing: get a full financial health review\n"
+        "- tables: see available database tables\n"
+        "- describe loans or show contributions: inspect database structure/data\n\n"
+        "I use fast local reasoning first, real database grounding for financial answers, "
+        "and the transformer model only when a general explanation is needed."
+        f"{focus}"
+    )
+
+
+def _is_followup_member_question(text: str) -> bool:
+    t = _lc(text)
+    return any(
+        p in t
+        for p in [
+            "what should i do",
+            "what do you recommend",
+            "recommend",
+            "next step",
+            "next steps",
+            "what is the risk",
+            "is this good",
+            "is this bad",
+            "should i worry",
+            "give me advice",
+        ]
+    )
+
+
+def _member_next_action_reply(schema: str, member_id: str, members_truth: pd.DataFrame) -> str:
+    if not member_id or not _member_exists(members_truth, str(member_id)):
+        return "Hello, type a member ID first, then ask for recommendations or next steps."
+
+    name = _member_name_from_truth(members_truth, str(member_id))
+    totals, _ = _compute_member_totals_from_tables(schema, str(member_id))
+    active_loan_balance = _to_float(totals.get("active_loan_balance"))
+    unpaid_interest = _to_float(totals.get("active_unpaid_interest"))
+    contributions_total = _to_float(totals.get("contributions_total"))
+    foundation_total = _to_float(totals.get("foundation_total"))
+    grade = _member_risk_grade(active_loan_balance, unpaid_interest)
+
+    lines = [
+        "Hello, here is my recommendation based on the current member data.",
+        "",
+        f"Member: {name} (member_id={member_id})",
+        f"Risk grade: {grade}",
+        f"Contributions total: {_fmt(contributions_total)}",
+        f"Foundation total: {_fmt(foundation_total)}",
+        f"Active loan balance: {_fmt(active_loan_balance)}",
+        f"Active unpaid interest: {_fmt(unpaid_interest)}",
+        "",
+    ]
+
+    if grade == "A":
+        lines += [
+            "Assessment: this member looks financially clean right now.",
+            "Next action: continue monitoring regular contributions and attendance.",
+        ]
+    elif grade == "B":
+        lines += [
+            "Assessment: this member has active loan exposure, but no unpaid interest is showing.",
+            "Next action: keep the repayment schedule visible and remind the member before the next due date.",
+        ]
+    else:
+        lines += [
+            "Assessment: this member needs closer monitoring because loan exposure and unpaid interest are both present.",
+            "Next action: contact the member, confirm repayment plan, and review whether new borrowing should be paused until repayment improves.",
+        ]
+
+    lines += ["", _db_proof_line(totals.get("_rows", {}))]
+    return "\n".join(lines)
+
+
 def _call_general_transformer_ai(
     q: str,
     history: List[Dict[str, str]],
@@ -3073,6 +3196,12 @@ def _call_general_transformer_ai(
                 "reason": "HF_TOKEN missing",
             },
         )
+
+    cache_key = _cache_key(q, history, preferred_model)
+    cached = _cache_get(cache_key)
+    if cached:
+        reply, used_source, meta = cached
+        return reply, used_source, meta
 
     messages = _build_hf_messages(q, history)
 
@@ -3104,15 +3233,19 @@ def _call_general_transformer_ai(
     if safety_status != "ok":
         used_source = f"{used_source}:{safety_status}"
 
+    meta = {
+        "hf_token_set": True,
+        "model": model_used,
+        "mode": mode,
+        "safety_status": safety_status,
+        "fast_mode": FAST_MODE,
+    }
+    _cache_set(cache_key, reply, used_source, meta)
+
     return (
         reply,
         used_source,
-        {
-            "hf_token_set": True,
-            "model": model_used,
-            "mode": mode,
-            "safety_status": safety_status,
-        },
+        meta,
     )
 
 
@@ -3322,7 +3455,15 @@ def _transformer_general_response(
             _small_talk_reply(q),
             "local:smalltalk",
             None,
-            {"smalltalk": True},
+            {"smalltalk": True, "fast_mode": FAST_MODE},
+        )
+
+    if _is_capability_request(q):
+        return (
+            _capability_reply(),
+            "local:capabilities",
+            None,
+            {"capabilities": True, "fast_mode": FAST_MODE},
         )
 
     if _requires_database_grounding(q):
@@ -3403,15 +3544,18 @@ def _handle_db_intent(
 
     if intent.intent == IntentType.CONTRIBUTIONS:
         mid = intent.member_id or _extract_member_id(q) or last_member_id
-        return _build_contribution_report(schema, members_truth, member_id=mid)[0], "contributions:intel", mid, _build_contribution_report(schema, members_truth, member_id=mid)[1]
+        reply, payload = _build_contribution_report(schema, members_truth, member_id=mid)
+        return reply, "contributions:intel", mid, payload
 
     if intent.intent == IntentType.FOUNDATION:
         mid = intent.member_id or _extract_member_id(q) or last_member_id
-        return _build_foundation_report(schema, members_truth, member_id=mid)[0], "foundation:intel", mid, _build_foundation_report(schema, members_truth, member_id=mid)[1]
+        reply, payload = _build_foundation_report(schema, members_truth, member_id=mid)
+        return reply, "foundation:intel", mid, payload
 
     if intent.intent == IntentType.LOANS:
         mid = intent.member_id or _extract_member_id(q) or last_member_id
-        return _build_loans_report(schema, members_truth, member_id=mid)[0], "loans:intel", mid, _build_loans_report(schema, members_truth, member_id=mid)[1]
+        reply, payload = _build_loans_report(schema, members_truth, member_id=mid)
+        return reply, "loans:intel", mid, payload
 
     if intent.intent == IntentType.PAYOUTS:
         mid = intent.member_id or _extract_member_id(q) or last_member_id
@@ -3481,6 +3625,11 @@ def health():
         "supabase_init_error": _SUPABASE_INIT_ERROR or None,
         "hf_token_set": bool(HF_TOKEN),
         "hf_models_locked": HF_ALLOWED_MODELS,
+        "hf_model_primary": HF_MODEL_PRIMARY,
+        "hf_timeout_seconds": HF_TIMEOUT_SECONDS,
+        "hf_max_retries": HF_MAX_RETRIES,
+        "fast_mode": FAST_MODE,
+        "general_cache_ttl_seconds": GENERAL_CACHE_TTL_SECONDS,
         "internet": "ON" if _internet_enabled() else "OFF",
         "schema_default": DEFAULT_SCHEMA,
     }
@@ -3542,6 +3691,15 @@ def chat(req: ChatRequest):
             meta={"schema": schema, "smalltalk": True},
         )
 
+    if _is_capability_request(q):
+        return ChatResponse(
+            reply=_clean_reply_for_ui(_capability_reply(last_member_id)),
+            used_source="local:capabilities",
+            member_id_focus=last_member_id,
+            dataframe=None,
+            meta={"schema": schema, "capabilities": True, "fast_mode": FAST_MODE},
+        )
+
     # Explain the last member report in plain English instead of re-printing
     # the same financial report.
     if _is_explain_previous_request(q):
@@ -3553,6 +3711,17 @@ def chat(req: ChatRequest):
             member_id_focus=last_member_id,
             dataframe=None,
             meta={"schema": schema, "intent": "explain_results", "member_id": last_member_id},
+        )
+
+    if _is_followup_member_question(q) and last_member_id:
+        members_truth = _load_members_truth(schema=schema, limit=3000)
+        reply = _member_next_action_reply(schema, last_member_id, members_truth)
+        return ChatResponse(
+            reply=_clean_reply_for_ui(reply),
+            used_source="member:recommendation",
+            member_id_focus=last_member_id,
+            dataframe=None,
+            meta={"schema": schema, "intent": "member_recommendation", "member_id": last_member_id, "fast_mode": FAST_MODE},
         )
 
     ctx = TransformerContext(
