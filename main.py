@@ -912,6 +912,24 @@ class AdvancedTransformerRouter:
     def route(self, ctx: TransformerContext) -> TransformerIntent:
         text = ctx.normalized
 
+        # Route simple greetings deterministically before confidence scoring.
+        # A single greeting keyword otherwise scores below the global
+        # TRANSFORMER_CONFIDENCE_THRESHOLD and falls back to GENERAL_AI.
+        greeting_text = re.sub(r"[!.,?]+$", "", _lc(text)).strip()
+        if greeting_text in {
+            "hello", "hi", "hey", "good morning",
+            "good afternoon", "good evening",
+        }:
+            return TransformerIntent(
+                intent=IntentType.GREETING,
+                confidence=1.0,
+                member_id=None,
+                relation=None,
+                requires_db=False,
+                requires_web=False,
+                reason="Direct greeting detected.",
+            )
+
         # IMPORTANT:
         # Only an ID explicitly typed in the CURRENT message should trigger
         # MEMBER_REPORT routing. Do not let ctx.last_member_id turn normal
