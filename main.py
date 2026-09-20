@@ -13,6 +13,7 @@ import re
 import time
 import math
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -165,6 +166,23 @@ UNIFIED_MODEL_NAME = _env("UNIFIED_MODEL_NAME", "younchat-unified-fast-v1")
 UNIFIED_EXPERT_MODE = _env("UNIFIED_EXPERT_MODE", "fast").lower()
 GENERAL_MAX_REPLY_CHARS = int(_env("GENERAL_MAX_REPLY_CHARS", "900") or "900")
 GENERAL_SHORT_ANSWER_MODE = _env("GENERAL_SHORT_ANSWER_MODE", "on").lower() not in {"0", "false", "off", "no"}
+
+# Composite-model + measure-theoretic controls
+# The expert family is treated as a finite measurable space. The gate produces
+# a probability measure mu_x over experts; synthesis uses expectations under mu_x.
+COMPOSITE_ALL_MODELS = _env("COMPOSITE_ALL_MODELS", "on").lower() not in {"0", "false", "off", "no"}
+COMPOSITE_MAX_WORKERS = max(1, int(_env("COMPOSITE_MAX_WORKERS", "7") or "7"))
+COMPOSITE_SYNTHESIS_MODEL = _env("COMPOSITE_SYNTHESIS_MODEL", HF_ALLOWED_MODELS[0])
+COMPOSITE_TEMPERATURE = max(0.05, float(_env("COMPOSITE_TEMPERATURE", "0.85") or "0.85"))
+COMPOSITE_FEATURE_DIM = max(32, int(_env("COMPOSITE_FEATURE_DIM", "128") or "128"))
+COMPOSITE_MIN_SUCCESS = max(1, int(_env("COMPOSITE_MIN_SUCCESS", "2") or "2"))
+
+# Physics-inspired unified-response control. These exact SI constants/equations
+# are used only to derive bounded numerical control signals; they do not imply
+# that language-model inference physically propagates at the speed of light.
+SPEED_OF_LIGHT_M_S = 299_792_458.0  # c
+PLANCK_CONSTANT_J_S = 6.62607015e-34  # h
+LIGHT_CONTROL_ENABLED = _env("LIGHT_CONTROL_ENABLED", "on").lower() not in {"0", "false", "off", "no"}
 
 
 def _internet_enabled() -> bool:
@@ -911,24 +929,6 @@ class AdvancedTransformerRouter:
 
     def route(self, ctx: TransformerContext) -> TransformerIntent:
         text = ctx.normalized
-
-        # Route simple greetings deterministically before confidence scoring.
-        # A single greeting keyword otherwise scores below the global
-        # TRANSFORMER_CONFIDENCE_THRESHOLD and falls back to GENERAL_AI.
-        greeting_text = re.sub(r"[!.,?]+$", "", _lc(text)).strip()
-        if greeting_text in {
-            "hello", "hi", "hey", "good morning",
-            "good afternoon", "good evening",
-        }:
-            return TransformerIntent(
-                intent=IntentType.GREETING,
-                confidence=1.0,
-                member_id=None,
-                relation=None,
-                requires_db=False,
-                requires_web=False,
-                reason="Direct greeting detected.",
-            )
 
         # IMPORTANT:
         # Only an ID explicitly typed in the CURRENT message should trigger
@@ -2976,6 +2976,387 @@ def _hf_call(
 
 
 # =============================================================================
+# COMPOSITE EXPERT MEASURE LAYER
+# =============================================================================
+
+def _stable_softmax(values: List[float], temperature: float = 1.0) -> List[float]:
+    """Continuous map R^n -> probability simplex (finite probability measure)."""
+    if not values:
+        return []
+    tau = max(0.05, float(temperature))
+    m = max(values)
+    exps = [math.exp((v - m) / tau) for v in values]
+    z = sum(exps) or 1.0
+    return [v / z for v in exps]
+
+
+def _bounded_prompt_features(text: str) -> List[float]:
+    """
+    Map arbitrary text into a bounded finite-dimensional cube [-1,1]^d.
+
+    This is the compact numerical control representation K used by the gate.
+    It is deliberately separate from the discrete token-generation map, so the
+    code does not falsely claim that autoregressive text generation is a
+    continuous real-valued function.
+    """
+    d = COMPOSITE_FEATURE_DIM
+    vec = [0.0] * d
+    tokens = re.findall(r"[a-z0-9_]+", _lc(text))
+    for token in tokens[:2048]:
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        idx = int.from_bytes(digest[:4], "big") % d
+        sign = 1.0 if (digest[4] & 1) == 0 else -1.0
+        vec[idx] += sign
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [max(-1.0, min(1.0, v / norm)) for v in vec]
+
+
+def _light_response_dynamics(text: str) -> Dict[str, float]:
+    """
+    Derive bounded synthesis controls from standard light equations.
+
+      c = f * lambda
+      E = h * f
+      E = m * c^2  =>  m = E / c^2
+      E = p * c    =>  p = E / c
+
+    The physical quantities are real SI values. Only dimensionless normalized
+    ratios derived from them are used by the model gate/synthesis controller.
+    """
+    clean = _clean(text)
+    words = re.findall(r"[A-Za-z0-9_]+", clean)
+    # Deterministic positive frequency in the visible-light range. Prompt
+    # complexity selects a point from 400 to 750 THz without changing c.
+    complexity = min(1.0, (len(words) + math.log1p(len(clean))) / 512.0)
+    frequency_hz = 4.0e14 + complexity * 3.5e14
+    wavelength_m = SPEED_OF_LIGHT_M_S / frequency_hz
+    photon_energy_j = PLANCK_CONSTANT_J_S * frequency_hz
+    mass_equivalent_kg = photon_energy_j / (SPEED_OF_LIGHT_M_S ** 2)
+    photon_momentum = photon_energy_j / SPEED_OF_LIGHT_M_S
+
+    # Dimensionless controller values.
+    frequency_ratio = (frequency_hz - 4.0e14) / 3.5e14
+    wavelength_ratio = (wavelength_m - (SPEED_OF_LIGHT_M_S / 7.5e14)) / (
+        (SPEED_OF_LIGHT_M_S / 4.0e14) - (SPEED_OF_LIGHT_M_S / 7.5e14)
+    )
+    synthesis_focus = max(0.0, min(1.0, 0.5 * frequency_ratio + 0.5 * (1.0 - wavelength_ratio)))
+    return {
+        "c_m_s": SPEED_OF_LIGHT_M_S,
+        "frequency_hz": frequency_hz,
+        "wavelength_m": wavelength_m,
+        "photon_energy_j": photon_energy_j,
+        "mass_equivalent_kg": mass_equivalent_kg,
+        "photon_momentum_kg_m_s": photon_momentum,
+        "complexity": complexity,
+        "synthesis_focus": synthesis_focus,
+    }
+
+
+def _model_prior_score(model: str, x: List[float]) -> float:
+    """Deterministic continuous affine score on the compact feature vector."""
+    digest = hashlib.sha256(model.encode("utf-8")).digest()
+    # Small deterministic coefficients avoid hard-coded 'winner' models while
+    # still allowing x-dependent continuous gating before expert evaluation.
+    score = 0.0
+    for j, value in enumerate(x):
+        b = digest[j % len(digest)]
+        coeff = (b / 255.0) - 0.5
+        score += coeff * value
+    return score / max(1.0, math.sqrt(len(x)))
+
+
+def _text_feature_embedding(text: str) -> List[float]:
+    """Bounded hashing embedding used only for consensus/disagreement metrics."""
+    return _bounded_prompt_features(text)
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    na = math.sqrt(sum(v * v for v in a))
+    nb = math.sqrt(sum(v * v for v in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return max(-1.0, min(1.0, sum(x * y for x, y in zip(a, b)) / (na * nb)))
+
+
+def _hf_call_single_model(
+    token: str,
+    messages: List[Dict[str, str]],
+    model: str,
+) -> Tuple[bool, str, str, str]:
+    """Call exactly one expert; no fallback substitution."""
+    force = (HF_FORCE_MODE or "auto").strip().lower()
+    prompt = _messages_to_prompt(messages)
+    if force == "completions":
+        modes = ["completions"]
+    elif force == "chat" or FAST_MODE:
+        modes = ["chat"]
+    else:
+        modes = ["chat", "completions"]
+
+    last_error = "Unknown HF error"
+    last_mode = modes[0]
+    for mode in modes:
+        last_mode = mode
+        if mode == "completions":
+            ok, txt = _hf_router_completions(model, token, prompt, timeout=HF_TIMEOUT_SECONDS)
+        else:
+            ok, txt = _hf_router_chat(model, token, messages, timeout=HF_TIMEOUT_SECONDS)
+        if ok and txt:
+            return True, txt, mode, model
+        last_error = txt
+    return False, last_error, last_mode, model
+
+
+def _finite_measure_statistics(weights: List[float]) -> Dict[str, float]:
+    """
+    Statistics of the finite probability measure mu_x on the expert set.
+    Entropy and effective support quantify concentration without pretending
+    the language models themselves form a continuous probability density.
+    """
+    if not weights:
+        return {"entropy": 0.0, "normalized_entropy": 0.0, "effective_experts": 0.0, "tv_from_uniform": 0.0}
+    n = len(weights)
+    entropy = -sum(w * math.log(max(w, 1e-15)) for w in weights)
+    normalized = entropy / math.log(n) if n > 1 else 0.0
+    effective = math.exp(entropy)
+    uniform = 1.0 / n
+    tv = 0.5 * sum(abs(w - uniform) for w in weights)
+    return {
+        "entropy": entropy,
+        "normalized_entropy": normalized,
+        "effective_experts": effective,
+        "tv_from_uniform": tv,
+    }
+
+
+def _convergent_composite_limit(
+    embeddings: List[List[float]],
+    weights: List[float],
+    tolerance: float = 1e-6,
+) -> Dict[str, Any]:
+    """
+    Build the partial composite sequence B_N and its finite-runtime limit estimate.
+
+    Mathematical model:
+        A_N = sum_{i=1}^N a_i Z_i
+        M_N = sum_{i=1}^N a_i
+        B_N = A_N / M_N
+
+    The ideal countable model is
+        B_infinity = (sum_{i=1}^infinity a_i Z_i) / (sum_{i=1}^infinity a_i).
+
+    If Z_i are bounded in the compact control set and a_i >= 0 with
+    sum_i a_i < infinity, then sum_i a_i Z_i converges absolutely in the
+    finite-dimensional Banach space.  The deployed system evaluates a finite
+    truncation B_N; adding more experts extends the same convergent sequence.
+    """
+    if not embeddings or not weights:
+        return {"limit_embedding": [], "partial_deltas": [], "converged": False, "terms": 0}
+
+    d = len(embeddings[0])
+    numerator = [0.0] * d
+    mass = 0.0
+    previous: Optional[List[float]] = None
+    deltas: List[float] = []
+    current = [0.0] * d
+
+    for emb, raw_weight in zip(embeddings, weights):
+        a_i = max(0.0, float(raw_weight))
+        mass += a_i
+        for j in range(d):
+            numerator[j] += a_i * emb[j]
+        if mass > 0:
+            current = [v / mass for v in numerator]
+        if previous is not None:
+            delta = math.sqrt(sum((a - b) ** 2 for a, b in zip(current, previous)))
+            deltas.append(delta)
+        previous = list(current)
+
+    converged = bool(not deltas or deltas[-1] <= max(0.0, tolerance))
+    return {
+        "limit_embedding": current,
+        "partial_deltas": deltas,
+        "last_delta": deltas[-1] if deltas else 0.0,
+        "converged_at_runtime_tolerance": converged,
+        "terms": len(embeddings),
+        "total_mass": mass,
+        "tolerance": tolerance,
+    }
+
+
+def _composite_expert_call(
+    token: str,
+    messages: List[Dict[str, str]],
+    preferred_model: Optional[str] = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Run the pretrained experts as one composite inference system.
+
+    Measure-theoretic interpretation:
+      Omega = finite expert set, F = power set of Omega.
+      mu_x({i}) = w_i(x), with w_i >= 0 and sum_i w_i = 1.
+      Expert feature outputs Z_i are measurable finite-dimensional vectors.
+      The barycenter E_mu[Z] = sum_i w_i Z_i is the Bochner integral on this
+      finite measure space.  Variance is E_mu[||Z-E_mu[Z]||^2].
+
+    The prompt gate is a continuous softmax over a compact bounded numerical
+    representation. Text generation remains discrete and is not claimed to be
+    continuous in the real-analysis sense.
+    """
+    models: List[str] = []
+    for m in ([preferred_model] if preferred_model else []) + list(HF_ALLOWED_MODELS):
+        m = _clean(str(m or ""))
+        if m and m not in models:
+            models.append(m)
+    if not COMPOSITE_ALL_MODELS:
+        models = models[:3]
+
+    user_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "user")
+    x = _bounded_prompt_features(user_text)
+    light = _light_response_dynamics(user_text) if LIGHT_CONTROL_ENABLED else {}
+    prior_scores = [_model_prior_score(m, x) for m in models]
+    # c=f*lambda supplies a deterministic bounded focus signal. Higher prompt
+    # complexity slightly lowers temperature, concentrating the expert measure.
+    light_focus = float(light.get("synthesis_focus", 0.0))
+    effective_temperature = max(0.05, COMPOSITE_TEMPERATURE * (1.0 - 0.20 * light_focus))
+    prior_weights = _stable_softmax(prior_scores, effective_temperature)
+
+    results: Dict[str, Dict[str, Any]] = {}
+    workers = min(COMPOSITE_MAX_WORKERS, max(1, len(models)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_hf_call_single_model, token, messages, m): m for m in models}
+        for future in as_completed(futures):
+            model = futures[future]
+            try:
+                ok, txt, mode, _ = future.result()
+            except Exception as exc:
+                ok, txt, mode = False, str(exc), "exception"
+            results[model] = {"ok": bool(ok), "text": txt if ok else "", "error": "" if ok else txt, "mode": mode}
+
+    successful = [m for m in models if results.get(m, {}).get("ok") and results[m].get("text")]
+    if not successful:
+        return False, "No composite expert returned a usable response.", {"experts": results}
+
+    # Condition the prior measure on the event A = {expert succeeded}.
+    # For a finite measure this is mu_x(. | A) = mu_x(.) / mu_x(A) on A.
+    mass = sum(prior_weights[models.index(m)] for m in successful) or 1.0
+    conditioned = [prior_weights[models.index(m)] / mass for m in successful]
+
+    embeddings = [_text_feature_embedding(results[m]["text"]) for m in successful]
+    d = COMPOSITE_FEATURE_DIM
+    barycenter = [sum(w * emb[j] for w, emb in zip(conditioned, embeddings)) for j in range(d)]
+    disagreement = sum(
+        w * sum((emb[j] - barycenter[j]) ** 2 for j in range(d))
+        for w, emb in zip(conditioned, embeddings)
+    )
+
+    # Posterior density with respect to the conditioned base measure. Agreement
+    # with the barycenter acts as a bounded likelihood; normalization gives the
+    # Radon-Nikodym density d nu_x / d mu_x on this finite space.
+    agreement = [(_cosine(emb, barycenter) + 1.0) / 2.0 for emb in embeddings]
+    likelihood = [0.25 + 0.75 * a for a in agreement]  # strictly positive/bounded
+    z = sum(w * l for w, l in zip(conditioned, likelihood)) or 1.0
+    posterior = [(w * l) / z for w, l in zip(conditioned, likelihood)]
+    rn_density = [p / max(w, 1e-15) for p, w in zip(posterior, conditioned)]
+
+    stats = _finite_measure_statistics(posterior)
+
+    # Partial composite functions U_N converge toward the ideal unified operator
+    # U_infinity whenever the countable expert coefficients are summable and the
+    # embedded expert outputs remain bounded.  At runtime we evaluate the finite
+    # truncation supplied by the available pretrained models.
+    limit_state = _convergent_composite_limit(embeddings, posterior)
+
+    candidate_blocks = []
+    for m, w, rn in zip(successful, posterior, rn_density):
+        candidate_blocks.append(
+            f"EXPERT={m}\nMEASURE_WEIGHT={w:.6f}\nRN_DENSITY={rn:.6f}\nANSWER:\n{results[m]['text']}"
+        )
+
+    synthesis_messages = [
+        {
+            "role": "system",
+            "content": (
+                _younchat_hf_system_prompt()
+                + "\nYou are the synthesis operator of Younchat's composite expert system. "
+                  "Produce one answer, not a list of model opinions. Preserve facts supported by "
+                  "multiple experts, resolve disagreements cautiously, and never mention internal "
+                  "expert names, weights, measure theory, or orchestration unless the user asks."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Original request:\n{user_text}\n\n"
+                "Unified response controller uses c=f*lambda, E=h*f, E=m*c^2, and E=p*c "
+                "as bounded numerical control equations; do not force physics into the answer unless relevant. "
+                "The expert family is interpreted as a finite truncation of a countable composite sequence. "
+                "Its partial functions U_N are required to approach a unified limit U_infinity under bounded-output "
+                "and summable-weight conditions. The available expert outputs are integrated under the posterior "
+                "probability measure. Synthesize the finite approximation to that unified limit. "
+                "Higher MEASURE_WEIGHT means greater contribution.\n\n"
+                + "\n\n---\n\n".join(candidate_blocks)
+            ),
+        },
+    ]
+
+    ok, final_text, synth_mode, synth_model = _hf_call_single_model(
+        token, synthesis_messages, COMPOSITE_SYNTHESIS_MODEL
+    )
+    if not ok:
+        # Measure-theoretic fallback: return the maximum-posterior expert.
+        best_idx = max(range(len(successful)), key=lambda i: posterior[i])
+        final_text = results[successful[best_idx]]["text"]
+        synth_model = successful[best_idx]
+        synth_mode = "posterior-map-fallback"
+
+    expert_meta = []
+    for m, prior, cond, post, agree, rn in zip(
+        successful,
+        [prior_weights[models.index(m)] for m in successful],
+        conditioned,
+        posterior,
+        agreement,
+        rn_density,
+    ):
+        expert_meta.append({
+            "model": m,
+            "prior_mass": prior,
+            "conditioned_mass": cond,
+            "posterior_mass": post,
+            "agreement": agree,
+            "radon_nikodym_density": rn,
+            "mode": results[m]["mode"],
+        })
+
+    meta = {
+        "architecture": "compact-countable-composite-limit-measure-v2",
+        "expert_count_requested": len(models),
+        "expert_count_successful": len(successful),
+        "experts": expert_meta,
+        "failed_experts": [m for m in models if m not in successful],
+        "measure_space": "finite experts with power-set sigma-algebra",
+        "integration": "finite Bochner truncation of a countable absolutely-convergent composite series",
+        "limit_equation": "U_infinity(x)=lim_{N->infinity} U_N(x)=S(integral_Omega Z_omega(x) dmu_x(omega))",
+        "partial_equation": "B_N=(sum_{i=1}^N a_i Z_i)/(sum_{i=1}^N a_i); U_N=S(B_N)",
+        "convergence_condition": "Z_i bounded; a_i>=0; sum_i a_i<infinity; sum_i a_i||Z_i||<infinity",
+        "runtime_limit_diagnostics": limit_state,
+        "posterior_update": "bounded likelihood; RN density relative to conditioned prior",
+        "feature_domain": f"compact cube [-1,1]^{COMPOSITE_FEATURE_DIM}",
+        "feature_variance": disagreement,
+        "light_equations": ["c=f*lambda", "E=h*f", "E=m*c^2", "E=p*c"],
+        "light_control": light,
+        "effective_gate_temperature": effective_temperature,
+        "synthesis_model": synth_model,
+        "synthesis_mode": synth_mode,
+        **stats,
+    }
+    return True, final_text, meta
+
+
+# =============================================================================
 # OUTPUT SAFETY
 # =============================================================================
 
@@ -3244,10 +3625,7 @@ def _call_general_transformer_ai(
         return (
             "Hello 👋🏽",
             "local:fallback",
-            {
-                "hf_token_set": False,
-                "reason": "HF_TOKEN missing",
-            },
+            {"hf_token_set": False, "reason": "HF_TOKEN missing"},
         )
 
     cache_key = _cache_key(q, history, preferred_model)
@@ -3258,38 +3636,47 @@ def _call_general_transformer_ai(
 
     messages = _build_hf_messages(q, history)
 
-    ok, txt, mode, model_used = _hf_call(
-        HF_TOKEN,
-        messages,
-        preferred_model=preferred_model,
-    )
-
-    internal_source = f"hf:{mode}:{model_used}" if ok else f"hf:failed:{model_used}"
-    used_source = f"unified:{UNIFIED_MODEL_NAME}" if UNIFIED_MODEL_MODE else internal_source
-
-    if not ok:
-        return (
-            f"Hello 👋🏽 The unified AI model is not reachable right now: {txt}",
-            used_source,
-            {
-                "hf_token_set": True,
-                "unified_model": UNIFIED_MODEL_MODE,
-                "unified_model_name": UNIFIED_MODEL_NAME,
-                "internal_model": model_used,
-                "internal_mode": mode,
-                "internal_source": internal_source,
-                "error": txt,
-            },
+    if UNIFIED_MODEL_MODE:
+        ok, txt, composite_meta = _composite_expert_call(
+            HF_TOKEN,
+            messages,
+            preferred_model=preferred_model,
         )
+        used_source = f"unified:{UNIFIED_MODEL_NAME}"
+        if not ok:
+            return (
+                f"Hello 👋🏽 The unified composite AI is not reachable right now: {txt}",
+                used_source,
+                {
+                    "hf_token_set": True,
+                    "unified_model": True,
+                    "unified_model_name": UNIFIED_MODEL_NAME,
+                    "error": txt,
+                    **composite_meta,
+                },
+            )
+        internal_source = "hf:composite-measure"
+        model_used = composite_meta.get("synthesis_model")
+        mode = composite_meta.get("synthesis_mode")
+    else:
+        ok, txt, mode, model_used = _hf_call(
+            HF_TOKEN,
+            messages,
+            preferred_model=preferred_model,
+        )
+        composite_meta = {}
+        internal_source = f"hf:{mode}:{model_used}" if ok else f"hf:failed:{model_used}"
+        used_source = internal_source
+        if not ok:
+            return (
+                f"Hello 👋🏽 The AI model is not reachable right now: {txt}",
+                used_source,
+                {"hf_token_set": True, "error": txt, "internal_model": model_used, "internal_mode": mode},
+            )
 
-    reply, safety_status = _sanitize_model_output(
-        txt,
-        safe_mode=safe_mode,
-    )
-
+    reply, safety_status = _sanitize_model_output(txt, safe_mode=safe_mode)
     if safety_status == "ok":
         reply = _make_general_reply_concise(reply)
-
     if safety_status != "ok":
         used_source = f"{used_source}:{safety_status}"
 
@@ -3303,14 +3690,10 @@ def _call_general_transformer_ai(
         "internal_source": internal_source,
         "safety_status": safety_status,
         "fast_mode": FAST_MODE,
+        **composite_meta,
     }
     _cache_set(cache_key, reply, used_source, meta)
-
-    return (
-        reply,
-        used_source,
-        meta,
-    )
+    return reply, used_source, meta
 
 
 # =============================================================================
@@ -3735,6 +4118,11 @@ def health():
         "general_cache_ttl_seconds": GENERAL_CACHE_TTL_SECONDS,
         "general_max_reply_chars": GENERAL_MAX_REPLY_CHARS,
         "general_short_answer_mode": GENERAL_SHORT_ANSWER_MODE,
+        "composite_all_models": COMPOSITE_ALL_MODELS,
+        "composite_max_workers": COMPOSITE_MAX_WORKERS,
+        "composite_synthesis_model": COMPOSITE_SYNTHESIS_MODEL,
+        "composite_temperature": COMPOSITE_TEMPERATURE,
+        "composite_feature_dim": COMPOSITE_FEATURE_DIM,
         "internet": "ON" if _internet_enabled() else "OFF",
         "schema_default": DEFAULT_SCHEMA,
     }
