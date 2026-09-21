@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 """
@@ -172,9 +173,9 @@ _env_blocked_tables = [
     for x in os.getenv("FAITH_BLOCKED_TABLES", "").split(",")
     if x.strip()
 ]
-BLOCKED_TABLE_PATTERNS = _unique(
+BLOCKED_TABLE_PATTERNS = list(dict.fromkeys(
     [*DEFAULT_BLOCKED_TABLE_PATTERNS, *_env_blocked_tables]
-)
+))
 
 MAX_DB_ROWS = max(20, int(os.getenv("MAX_DB_ROWS", "500")))
 CATALOG_CACHE_SECONDS = max(5, int(os.getenv("CATALOG_CACHE_SECONDS", "45")))
@@ -2592,4 +2593,3 @@ def chat(req: ChatRequest):
 # POST /catalog/refresh
 # POST /chat
 # =============================================================================
-
