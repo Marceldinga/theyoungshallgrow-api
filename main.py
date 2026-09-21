@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 """
@@ -49,7 +48,7 @@ except Exception as e:
 # =============================================================================
 
 APP_NAME = "Faithi API"
-APP_VERSION = "4.3.0"
+APP_VERSION = "4.4.0"
 ASSISTANT_NAME = "Faithi"
 BRAND_NAME = "Faith Hairstyle"
 
@@ -102,6 +101,13 @@ for _m in [HF_MODEL_PRIMARY, *_env_fallbacks, *DEFAULT_MODELS]:
     if _m and _m not in HF_MODELS:
         HF_MODELS.append(_m)
 
+# Faithi v4.4 dynamically discovers the live public schema instead of
+# assuming that the business uses a fixed list of table names.
+#
+# FAITH_PUBLIC_TABLES  # optional; blank = auto-discover customer-safe relations
+# FAITH_BLOCKED_TABLES # optional additional exclusions is now an OPTIONAL explicit include list. Leave it blank
+# for automatic discovery. FAITH_BLOCKED_TABLES can add business-specific
+# exclusions without changing code.
 DEFAULT_PUBLIC_TABLES = [
     "services",
     "hair_colors",
@@ -120,7 +126,55 @@ _env_tables = [
     for x in os.getenv("FAITH_PUBLIC_TABLES", "").split(",")
     if x.strip()
 ]
-PUBLIC_TABLES = _env_tables or DEFAULT_PUBLIC_TABLES
+PUBLIC_TABLES = _env_tables  # empty means automatic discovery
+
+DEFAULT_BLOCKED_TABLE_PATTERNS = [
+    "auth",
+    "admin",
+    "owner",
+    "profile",
+    "profiles",
+    "customer",
+    "customers",
+    "user",
+    "users",
+    "account",
+    "accounts",
+    "session",
+    "sessions",
+    "token",
+    "tokens",
+    "secret",
+    "password",
+    "credential",
+    "credentials",
+    "booking",
+    "bookings",
+    "appointment",
+    "appointments",
+    "payment",
+    "payments",
+    "invoice",
+    "invoices",
+    "message",
+    "messages",
+    "chat",
+    "chats",
+    "conversation",
+    "conversations",
+    "audit",
+    "audit_log",
+    "logs",
+]
+
+_env_blocked_tables = [
+    x.strip().lower()
+    for x in os.getenv("FAITH_BLOCKED_TABLES", "").split(",")
+    if x.strip()
+]
+BLOCKED_TABLE_PATTERNS = _unique(
+    [*DEFAULT_BLOCKED_TABLE_PATTERNS, *_env_blocked_tables]
+)
 
 MAX_DB_ROWS = max(20, int(os.getenv("MAX_DB_ROWS", "500")))
 CATALOG_CACHE_SECONDS = max(5, int(os.getenv("CATALOG_CACHE_SECONDS", "45")))
@@ -132,6 +186,8 @@ _catalog_cache: Dict[str, Any] = {
     "at": 0.0,
     "rows": [],
     "relations": {},
+    "blocked_relations": [],
+    "schema_discovery_error": "",
 }
 
 _response_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -375,12 +431,123 @@ def _sb_select_rest(
         return False, [], str(e)
 
 
+def _safe_relation_identifier(name: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or ""))
+
+
+def _blocked_relation(name: str) -> bool:
+    """Conservative privacy boundary for global LLM/RAG knowledge."""
+    n = (name or "").strip().lower()
+    if not n:
+        return True
+
+    # Match exact names and token-like segments. This intentionally blocks
+    # private operational/customer data from being injected into prompts.
+    parts = set(re.split(r"[^a-z0-9]+|_", n))
+    for pattern in BLOCKED_TABLE_PATTERNS:
+        p = pattern.lower().strip()
+        if not p:
+            continue
+        if n == p or p in parts:
+            return True
+        if n.startswith(p + "_") or n.endswith("_" + p):
+            return True
+    return False
+
+
+def _discover_schema_table_names() -> Tuple[List[str], str]:
+    """
+    Ask PostgREST for its OpenAPI document and derive the relations that are
+    actually exposed in the configured schema. This avoids guessing table
+    names and automatically follows the live Faith Hairstyle database.
+    """
+    if not SUPABASE_URL or not _supabase_key():
+        return [], "Supabase is not configured."
+
+    try:
+        headers = _rest_headers()
+        headers["Accept"] = "application/openapi+json, application/json"
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/",
+            headers=headers,
+            timeout=15,
+        )
+        if not (200 <= r.status_code < 300):
+            return [], f"OpenAPI discovery HTTP {r.status_code}: {r.text[:300]}"
+
+        spec = r.json()
+        paths = spec.get("paths", {}) if isinstance(spec, dict) else {}
+        names: List[str] = []
+
+        if isinstance(paths, dict):
+            for raw_path in paths.keys():
+                if not isinstance(raw_path, str):
+                    continue
+                # Table/view paths are normally '/relation'. RPC endpoints are
+                # '/rpc/function' and are deliberately excluded.
+                path = raw_path.strip("/")
+                if not path or "/" in path or path.startswith("rpc/"):
+                    continue
+                if _safe_relation_identifier(path):
+                    names.append(path)
+
+        # Some PostgREST/OpenAPI versions expose definitions even when paths
+        # are sparse. Add safe definition names as a secondary source.
+        definitions = spec.get("definitions", {}) if isinstance(spec, dict) else {}
+        if isinstance(definitions, dict):
+            for name in definitions.keys():
+                if isinstance(name, str) and _safe_relation_identifier(name):
+                    names.append(name)
+
+        return sorted(_unique(names)), ""
+    except Exception as e:
+        return [], str(e)
+
+
+def _knowledge_relation_names() -> Tuple[List[str], List[str], str]:
+    """
+    Returns (allowed, blocked, discovery_error).
+
+    If FAITH_PUBLIC_TABLES is set, it acts as an explicit include list.
+    Otherwise Faithi discovers every exposed relation and automatically
+    excludes privacy-sensitive operational tables.
+    """
+    if PUBLIC_TABLES:
+        candidates = [x for x in PUBLIC_TABLES if _safe_relation_identifier(x)]
+        discovery_error = ""
+    else:
+        candidates, discovery_error = _discover_schema_table_names()
+        # Safe compatibility fallback if OpenAPI discovery is disabled by the
+        # project: probe the known customer-safe business tables.
+        if not candidates:
+            candidates = list(DEFAULT_PUBLIC_TABLES)
+
+    allowed: List[str] = []
+    blocked: List[str] = []
+    for name in candidates:
+        if _blocked_relation(name):
+            blocked.append(name)
+        else:
+            allowed.append(name)
+
+    return sorted(_unique(allowed)), sorted(_unique(blocked)), discovery_error
+
+
 def _sb_select(
     relation: str,
     limit: int = MAX_DB_ROWS,
+    *,
+    enforce_knowledge_boundary: bool = True,
 ) -> Tuple[bool, List[Dict[str, Any]], str]:
-    if relation not in PUBLIC_TABLES:
-        return False, [], "Relation is not in Faithi's public knowledge allowlist."
+    if not _safe_relation_identifier(relation):
+        return False, [], "Invalid relation identifier."
+
+    if enforce_knowledge_boundary:
+        allowed, _, _ = _knowledge_relation_names()
+        if relation not in allowed:
+            return False, [], (
+                "Relation is outside Faithi's customer-safe knowledge boundary."
+            )
 
     client = _get_supabase_client()
 
@@ -405,14 +572,21 @@ def _discover_public_relations(force: bool = False) -> Dict[str, Dict[str, Any]]
         return _catalog_cache["relations"]
 
     relations: Dict[str, Dict[str, Any]] = {}
+    allowed, blocked, discovery_error = _knowledge_relation_names()
 
-    for table in PUBLIC_TABLES:
-        ok, rows, error = _sb_select(table, limit=MAX_DB_ROWS)
+    for table in allowed:
+        # Already checked against the knowledge boundary above.
+        ok, rows, error = _sb_select(
+            table,
+            limit=MAX_DB_ROWS,
+            enforce_knowledge_boundary=False,
+        )
         if ok:
             relations[table] = {
                 "available": True,
                 "row_count_loaded": len(rows),
                 "rows": rows,
+                "error": "",
             }
         else:
             relations[table] = {
@@ -423,6 +597,8 @@ def _discover_public_relations(force: bool = False) -> Dict[str, Dict[str, Any]]
             }
 
     _catalog_cache["relations"] = relations
+    _catalog_cache["blocked_relations"] = blocked
+    _catalog_cache["schema_discovery_error"] = discovery_error
     _catalog_cache["at"] = time.time()
     return relations
 
@@ -2190,8 +2366,11 @@ def health():
         "internet_configured": bool(
             TAVILY_API_KEY and INTERNET_MODE
         ),
+        "table_discovery_mode": "explicit" if PUBLIC_TABLES else "automatic",
         "public_tables_configured": PUBLIC_TABLES,
         "public_tables_available": available_tables,
+        "blocked_tables": _catalog_cache.get("blocked_relations", []),
+        "schema_discovery_error": _catalog_cache.get("schema_discovery_error", ""),
         "model_primary": HF_MODEL_PRIMARY,
         "models_configured": HF_MODELS,
         "models_healthy": healthy_models,
@@ -2208,6 +2387,7 @@ def relations():
 
     return {
         "assistant": ASSISTANT_NAME,
+        "discovery_mode": "explicit" if PUBLIC_TABLES else "automatic",
         "relations": {
             name: {
                 "available": info.get("available", False),
@@ -2219,6 +2399,10 @@ def relations():
             }
             for name, info in discovered.items()
         },
+        "blocked_relations": _catalog_cache.get("blocked_relations", []),
+        "schema_discovery_error": _catalog_cache.get(
+            "schema_discovery_error", ""
+        ),
         "note": (
             "Salon knowledge, colors, service images and availability are "
             "exposed to Faithi's RAG layer. Customer profiles, raw bookings, "
@@ -2230,11 +2414,12 @@ def relations():
 
 @app.get("/preview/{relation}")
 def preview(relation: str, limit: int = 20):
-    if relation not in PUBLIC_TABLES:
+    allowed, _, _ = _knowledge_relation_names()
+    if relation not in allowed:
         raise HTTPException(
             status_code=403,
             detail=(
-                "That relation is not in Faithi's public knowledge allowlist."
+                "That relation is outside Faithi's customer-safe knowledge boundary."
             ),
         )
 
@@ -2393,7 +2578,8 @@ def chat(req: ChatRequest):
 # INTERNET_MODE=true
 # HF_MODEL_PRIMARY=meta-llama/Llama-3.1-8B-Instruct
 # HF_MODEL_FALLBACKS
-# FAITH_PUBLIC_TABLES
+# FAITH_PUBLIC_TABLES  # optional; blank = auto-discover customer-safe relations
+# FAITH_BLOCKED_TABLES # optional additional exclusions
 #
 # Railway start command:
 # uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -2406,3 +2592,4 @@ def chat(req: ChatRequest):
 # POST /catalog/refresh
 # POST /chat
 # =============================================================================
+
