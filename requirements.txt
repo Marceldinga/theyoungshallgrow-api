@@ -4,3 +4,5 @@ requests==2.32.3
 pandas==2.2.2
 supabase==2.6.0
 python-multipart==0.0.9
+pydantic>=2.9,<3
+edge-tts>=6.1.12,<8
