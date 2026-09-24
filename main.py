@@ -49,7 +49,7 @@ except Exception as e:
 # =============================================================================
 
 APP_NAME = "Faithi API"
-APP_VERSION = "4.4.0"
+APP_VERSION = "4.5.0"
 ASSISTANT_NAME = "Faithi"
 BRAND_NAME = "Faith Hairstyle"
 
@@ -61,9 +61,9 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
-HF_TIMEOUT_SECONDS = max(5, int(os.getenv("HF_TIMEOUT_SECONDS", "20")))
-HF_MAX_RETRIES = max(0, int(os.getenv("HF_MAX_RETRIES", "1")))
-MAX_RESPONSE_TOKENS = max(80, int(os.getenv("MAX_RESPONSE_TOKENS", "450")))
+HF_TIMEOUT_SECONDS = max(5, int(os.getenv("HF_TIMEOUT_SECONDS", "15")))
+HF_MAX_RETRIES = 0  # single fast attempt; no retry/fallback model loop
+MAX_RESPONSE_TOKENS = max(80, int(os.getenv("MAX_RESPONSE_TOKENS", "280")))
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -71,18 +71,9 @@ INTERNET_MODE = os.getenv("INTERNET_MODE", "true").lower() in {
     "1", "true", "yes", "on"
 }
 
-# Keep every requested model registered.
-# The model already verified as working is first.
-DEFAULT_MODELS = [
-    "meta-llama/Llama-3.1-8B-Instruct",
-    "meta-llama/Meta-Llama-3-8B-Instruct",
-    "mistralai/Mistral-7B-Instruct-v0.2",
-    "Qwen/Qwen2.5-3B-Instruct",
-    "meta-llama/Llama-3.2-3B-Instruct",
-    "microsoft/Phi-3.5-mini-instruct",
-    "Qwen/Qwen2.5-1.5B-Instruct",
-]
-
+# ONE AI MODEL ONLY.
+# Faithi uses the primary model directly. No fallback model registry,
+# no alternate model routing, and no second-model verification.
 HF_MODEL_PRIMARY = (
     os.getenv(
         "HF_MODEL_PRIMARY",
@@ -91,16 +82,7 @@ HF_MODEL_PRIMARY = (
     or "meta-llama/Llama-3.1-8B-Instruct"
 )
 
-_env_fallbacks = [
-    x.strip()
-    for x in os.getenv("HF_MODEL_FALLBACKS", "").split(",")
-    if x.strip()
-]
-
-HF_MODELS: List[str] = []
-for _m in [HF_MODEL_PRIMARY, *_env_fallbacks, *DEFAULT_MODELS]:
-    if _m and _m not in HF_MODELS:
-        HF_MODELS.append(_m)
+HF_MODELS: List[str] = [HF_MODEL_PRIMARY]
 
 # Faithi v4.4 dynamically discovers the live public schema instead of
 # assuming that the business uses a fixed list of table names.
@@ -192,6 +174,8 @@ _catalog_cache: Dict[str, Any] = {
 }
 
 _response_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+_table_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
 
 # =============================================================================
@@ -668,7 +652,51 @@ def _normalize_catalog_row(table: str, row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _public_raw_rows(
+    table: str,
+    force: bool = False,
+) -> List[Dict[str, Any]]:
+    """Fast targeted fetch for a known customer-safe public relation."""
+    table = (table or "").strip()
+
+    if not _safe_relation_identifier(table):
+        return []
+
+    if _blocked_relation(table):
+        return []
+
+    # Limit fast-path access to the explicitly configured list when present,
+    # otherwise to the known customer-safe Faith Hairstyle tables.
+    allowed_fast = set(PUBLIC_TABLES or DEFAULT_PUBLIC_TABLES)
+    if table not in allowed_fast:
+        return []
+
+    cached = _table_cache.get(table)
+    if (
+        not force
+        and cached
+        and time.time() - float(cached[0]) < CATALOG_CACHE_SECONDS
+    ):
+        return list(cached[1])
+
+    ok, rows, _ = _sb_select(
+        table,
+        limit=MAX_DB_ROWS,
+        enforce_knowledge_boundary=False,
+    )
+
+    safe_rows = rows if ok else []
+    _table_cache[table] = (time.time(), safe_rows)
+    return list(safe_rows)
+
+
 def _load_catalog(force: bool = False) -> List[Dict[str, Any]]:
+    """
+    Fast salon catalog load.
+
+    Customer chat does not need to discover/load every exposed table.
+    Services and hair colors are fetched directly and cached.
+    """
     if (
         not force
         and _catalog_cache["rows"]
@@ -676,14 +704,10 @@ def _load_catalog(force: bool = False) -> List[Dict[str, Any]]:
     ):
         return _catalog_cache["rows"]
 
-    relations = _discover_public_relations(force=force)
     rows: List[Dict[str, Any]] = []
 
-    for table, info in relations.items():
-        if not info.get("available"):
-            continue
-
-        for raw in info.get("rows", []):
+    for table in ("services", "hair_colors"):
+        for raw in _public_raw_rows(table, force=force):
             if not isinstance(raw, dict):
                 continue
 
@@ -699,13 +723,8 @@ def _load_catalog(force: bool = False) -> List[Dict[str, Any]]:
                 rows.append(item)
 
     _catalog_cache["rows"] = rows
+    _catalog_cache["at"] = time.time()
     return rows
-
-
-def _public_raw_rows(table: str) -> List[Dict[str, Any]]:
-    relations = _discover_public_relations()
-    info = relations.get(table) or {}
-    return list(info.get("rows") or [])
 
 
 def _service_like(item: Dict[str, Any]) -> bool:
@@ -714,7 +733,6 @@ def _service_like(item: Dict[str, Any]) -> bool:
         "hairstyles",
         "styles",
         "gallery",
-        "hair_colors",
     }
 
 
@@ -1314,51 +1332,8 @@ def _model_order(
     preferred: Optional[str] = None,
     include_disabled: bool = False,
 ) -> List[str]:
-    configured = _unique(
-        ([preferred] if preferred else [])
-        + [HF_MODEL_PRIMARY]
-        + HF_MODELS
-    )
-
-    healthy = [
-        model
-        for model in configured
-        if MODEL_HEALTH.get(model, {}).get("ok") is True
-    ]
-
-    untested = [
-        model
-        for model in configured
-        if model not in MODEL_HEALTH
-    ]
-
-    disabled = [
-        model
-        for model in configured
-        if MODEL_HEALTH.get(model, {}).get("ok") is False
-    ]
-
-    ordered: List[str] = []
-
-    if preferred and preferred in configured:
-        state = MODEL_HEALTH.get(preferred)
-        if state is None or state.get("ok") is True:
-            ordered.append(preferred)
-
-    for model in healthy:
-        if model not in ordered:
-            ordered.append(model)
-
-    for model in untested:
-        if model not in ordered:
-            ordered.append(model)
-
-    if include_disabled:
-        for model in disabled:
-            if model not in ordered:
-                ordered.append(model)
-
-    return ordered
+    # Strict single-model policy. Ignore alternate model requests.
+    return [HF_MODEL_PRIMARY]
 
 
 def _model_quality_score(model: str) -> float:
@@ -1379,21 +1354,7 @@ def _model_quality_score(model: str) -> float:
 def _smart_model_order(
     preferred: Optional[str] = None,
 ) -> List[str]:
-    candidates = _model_order(preferred)
-
-    if not candidates:
-        return []
-
-    if preferred and preferred in candidates:
-        rest = [m for m in candidates if m != preferred]
-        rest.sort(key=_model_quality_score, reverse=True)
-        return [preferred] + rest
-
-    return sorted(
-        candidates,
-        key=_model_quality_score,
-        reverse=True,
-    )
+    return [HF_MODEL_PRIMARY]
 
 
 # =============================================================================
@@ -1434,7 +1395,7 @@ def _history_messages(
 ) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
 
-    for item in history[-12:]:
+    for item in history[-8:]:
         role = _clean_text(item.get("role")).lower()
         content = _clean_text(item.get("content") or item.get("message"))
 
@@ -1480,7 +1441,7 @@ live database context.
 
     attempts: List[Dict[str, Any]] = []
 
-    for model in _smart_model_order(preferred_model):
+    for model in [HF_MODEL_PRIMARY]:
         ok, text, error, latency_ms = _hf_chat_single(
             model=model,
             messages=messages,
@@ -1820,6 +1781,234 @@ def _business_fallback(
     return "\n".join(compact)
 
 
+
+def _row_enabled(row: Dict[str, Any]) -> bool:
+    for key in ("is_active", "active", "enabled"):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if isinstance(value, bool):
+            if not value:
+                return False
+            continue
+        text_value = _clean_text(value).lower()
+        if text_value in {"false", "0", "no", "off", "inactive", "disabled"}:
+            return False
+    return True
+
+
+def _slot_is_open(row: Dict[str, Any]) -> bool:
+    if not _row_enabled(row):
+        return False
+
+    for key in ("is_available", "available", "open"):
+        if key not in row:
+            continue
+        value = row.get(key)
+        if isinstance(value, bool):
+            if not value:
+                return False
+            continue
+        text_value = _clean_text(value).lower()
+        if text_value in {"false", "0", "no", "off", "closed", "unavailable"}:
+            return False
+
+    status = _clean_text(row.get("status")).lower()
+    if status in {
+        "booked",
+        "blocked",
+        "closed",
+        "taken",
+        "unavailable",
+        "cancelled",
+        "canceled",
+    }:
+        return False
+
+    return True
+
+
+def _pretty_time(value: Any) -> str:
+    raw = _clean_text(value)
+    if not raw:
+        return ""
+
+    candidate = raw.split("+")[0].split("Z")[0]
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            parsed = datetime.strptime(candidate, fmt)
+            return parsed.strftime("%I:%M %p").lstrip("0")
+        except Exception:
+            pass
+    return raw
+
+
+def _pretty_date(value: Any) -> str:
+    raw = _clean_text(value)
+    if not raw:
+        return ""
+
+    candidate = raw[:10]
+    try:
+        parsed = datetime.strptime(candidate, "%Y-%m-%d")
+        return parsed.strftime("%a, %b %d").replace(" 0", " ")
+    except Exception:
+        return raw
+
+
+def _fast_colors_response() -> ChatResponse:
+    rows = [
+        row for row in _public_raw_rows("hair_colors")
+        if isinstance(row, dict) and _row_enabled(row)
+    ]
+
+    safe_rows: List[Dict[str, Any]] = []
+    seen = set()
+
+    for row in rows:
+        code = _clean_text(row.get("code"))
+        name = _clean_text(row.get("name") or row.get("color_name"))
+
+        if not code and not name:
+            continue
+
+        key = (code.lower(), name.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        safe_rows.append({
+            "source_table": "hair_colors",
+            "code": code,
+            "name": name,
+        })
+
+    safe_rows.sort(key=lambda row: (
+        _clean_text(row.get("code")).lower(),
+        _clean_text(row.get("name")).lower(),
+    ))
+
+    if safe_rows:
+        shown = safe_rows[:14]
+        lines = [
+            "Here are the available Faith Hairstyle hair colors:",
+            *[
+                f"• {row['code']} — {row['name']}"
+                if row["code"] and row["name"]
+                else f"• {row['code'] or row['name']}"
+                for row in shown
+            ],
+        ]
+        reply = "\n".join(lines)
+    else:
+        reply = (
+            "I don’t see any active hair colors in the live salon list right now."
+        )
+
+    return ChatResponse(
+        reply=reply,
+        used_source="supabase-fast",
+        member_id_focus=None,
+        dataframe=_df_payload(safe_rows, limit=20),
+        meta={
+            "assistant": ASSISTANT_NAME,
+            "brand": BRAND_NAME,
+            "version": APP_VERSION,
+            "intent": IntentType.COLORS.value,
+            "fast_path": True,
+            "model": None,
+            "database_grounded": bool(safe_rows),
+        },
+    )
+
+
+def _fast_availability_response() -> ChatResponse:
+    rows = [
+        row for row in _public_raw_rows("availability_slots")
+        if isinstance(row, dict) and _slot_is_open(row)
+    ]
+
+    def sort_key(row: Dict[str, Any]):
+        date_value = _clean_text(
+            row.get("slot_date")
+            or row.get("date")
+            or row.get("booking_date")
+        )
+        start_value = _clean_text(
+            row.get("start_time")
+            or row.get("time")
+            or row.get("slot_time")
+        )
+        return (date_value, start_value)
+
+    rows.sort(key=sort_key)
+
+    safe_rows: List[Dict[str, Any]] = []
+    lines: List[str] = []
+
+    for row in rows[:8]:
+        date_value = (
+            row.get("slot_date")
+            or row.get("date")
+            or row.get("booking_date")
+        )
+        start_value = (
+            row.get("start_time")
+            or row.get("time")
+            or row.get("slot_time")
+        )
+        end_value = row.get("end_time")
+
+        pretty_date = _pretty_date(date_value)
+        pretty_start = _pretty_time(start_value)
+        pretty_end = _pretty_time(end_value)
+
+        if not pretty_date and not pretty_start:
+            continue
+
+        if pretty_end:
+            display = f"{pretty_date} • {pretty_start}–{pretty_end}".strip(" •")
+        else:
+            display = f"{pretty_date} • {pretty_start}".strip(" •")
+
+        lines.append(f"• {display}")
+
+        safe_rows.append({
+            "source_table": "availability_slots",
+            "slot_date": _clean_text(date_value),
+            "start_time": _clean_text(start_value),
+            "end_time": _clean_text(end_value),
+        })
+
+    if lines:
+        reply = (
+            "Here are the next available appointment times:\n"
+            + "\n".join(lines)
+            + "\nTap Book when you see a time you want."
+        )
+    else:
+        reply = (
+            "I don’t see an open appointment slot in the live availability list "
+            "right now. Please open the Book page to check the latest calendar."
+        )
+
+    return ChatResponse(
+        reply=reply,
+        used_source="supabase-fast",
+        member_id_focus=None,
+        dataframe=_df_payload(safe_rows, limit=12),
+        meta={
+            "assistant": ASSISTANT_NAME,
+            "brand": BRAND_NAME,
+            "version": APP_VERSION,
+            "intent": IntentType.AVAILABILITY.value,
+            "fast_path": True,
+            "model": None,
+            "database_grounded": bool(safe_rows),
+        },
+    )
+
+
 def _deterministic_repair(
     answer: str,
     intent: IntentType,
@@ -1962,13 +2151,7 @@ def _reasoning_plan(
         retrieval_meta.get("retrieval_confidence") or 0.0
     )
 
-    verify_with_second_model = (
-        risk == GroundingRisk.HIGH
-        and (
-            intent_confidence < 0.78
-            or retrieval_conf < 0.35
-        )
-    )
+    verify_with_second_model = False
 
     return {
         "intent": intent.value,
@@ -2037,11 +2220,20 @@ def _advanced_chat_pipeline(req: ChatRequest) -> ChatResponse:
             },
         )
 
+    # FAST DATABASE PATHS.
+    # These common salon actions do not need an LLM round trip.
+    if intent == IntentType.COLORS:
+        return _fast_colors_response()
+
+    if intent == IntentType.AVAILABILITY:
+        return _fast_availability_response()
+
     cache_payload = {
         "message": reasoning_text,
         "intent": intent.value,
-        "model": req.model,
+        "model": HF_MODEL_PRIMARY,
         "page": req.page,
+        "history_tail": _history_messages(req.history)[-4:],
         "advanced": True,
     }
 
@@ -2167,7 +2359,7 @@ def _advanced_chat_pipeline(req: ChatRequest) -> ChatResponse:
         user_text=original_text,
         db_context=db_context,
         history=req.history,
-        preferred_model=req.model,
+        preferred_model=HF_MODEL_PRIMARY,
         risk=risk,
     )
 
@@ -2534,6 +2726,7 @@ def refresh_catalog():
     _catalog_cache["at"] = 0.0
     _catalog_cache["rows"] = []
     _catalog_cache["relations"] = {}
+    _table_cache.clear()
 
     rows = _load_catalog(force=True)
 
@@ -2578,7 +2771,6 @@ def chat(req: ChatRequest):
 # TAVILY_API_KEY
 # INTERNET_MODE=true
 # HF_MODEL_PRIMARY=meta-llama/Llama-3.1-8B-Instruct
-# HF_MODEL_FALLBACKS
 # FAITH_PUBLIC_TABLES  # optional; blank = auto-discover customer-safe relations
 # FAITH_BLOCKED_TABLES # optional additional exclusions
 #
