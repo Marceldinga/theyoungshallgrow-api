@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-Faithi v4.3.0 Advanced Reasoning
+Faithi v4.6.0 Production Fast Path + Neural Voice
 Faith Hairstyle AI backend.
 
 Complete standalone main.py.
@@ -12,8 +12,9 @@ Core behavior:
 - Live Supabase public-data grounding
 - Real service prices/images only
 - Hybrid local retrieval/RAG
-- Hugging Face multi-model health testing and fallback routing
-- Healthy models preferred; failed models retained for later retesting
+- One Hugging Face primary model only
+- Fast deterministic paths for common salon questions
+- Server-side female neural TTS
 - Optional Tavily web search
 - Answer verification and deterministic repair
 - Flutter-friendly /chat response
@@ -32,9 +33,17 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+
+try:
+    import edge_tts
+except Exception as e:
+    raise RuntimeError(
+        "Missing dependency: edge-tts. Add `edge-tts` to requirements.txt"
+    ) from e
 
 try:
     from supabase import create_client
@@ -49,7 +58,7 @@ except Exception as e:
 # =============================================================================
 
 APP_NAME = "Faithi API"
-APP_VERSION = "4.5.0"
+APP_VERSION = "4.6.0"
 ASSISTANT_NAME = "Faithi"
 BRAND_NAME = "Faith Hairstyle"
 
@@ -61,9 +70,9 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_ROUTER_CHAT_URL = "https://router.huggingface.co/v1/chat/completions"
-HF_TIMEOUT_SECONDS = max(5, int(os.getenv("HF_TIMEOUT_SECONDS", "15")))
+HF_TIMEOUT_SECONDS = max(5, int(os.getenv("HF_TIMEOUT_SECONDS", "12")))
 HF_MAX_RETRIES = 0  # single fast attempt; no retry/fallback model loop
-MAX_RESPONSE_TOKENS = max(80, int(os.getenv("MAX_RESPONSE_TOKENS", "280")))
+MAX_RESPONSE_TOKENS = max(80, int(os.getenv("MAX_RESPONSE_TOKENS", "220")))
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "").strip()
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -83,6 +92,14 @@ HF_MODEL_PRIMARY = (
 )
 
 HF_MODELS: List[str] = [HF_MODEL_PRIMARY]
+
+# Consistent server-side female neural voice. This avoids browser/device TTS
+# silently selecting a male or low-quality local voice.
+TTS_VOICE = os.getenv("TTS_VOICE", "en-US-AvaNeural").strip() or "en-US-AvaNeural"
+TTS_RATE = os.getenv("TTS_RATE", "+18%").strip() or "+18%"
+TTS_PITCH = os.getenv("TTS_PITCH", "+0Hz").strip() or "+0Hz"
+TTS_MAX_CHARS = max(200, min(2200, int(os.getenv("TTS_MAX_CHARS", "1600"))))
+TTS_CACHE_ITEMS = max(8, min(128, int(os.getenv("TTS_CACHE_ITEMS", "48"))))
 
 # Faithi v4.4 dynamically discovers the live public schema instead of
 # assuming that the business uses a fixed list of table names.
@@ -160,8 +177,8 @@ BLOCKED_TABLE_PATTERNS = list(dict.fromkeys(
 ))
 
 MAX_DB_ROWS = max(20, int(os.getenv("MAX_DB_ROWS", "500")))
-CATALOG_CACHE_SECONDS = max(5, int(os.getenv("CATALOG_CACHE_SECONDS", "45")))
-RESPONSE_CACHE_SECONDS = max(0, int(os.getenv("RESPONSE_CACHE_SECONDS", "30")))
+CATALOG_CACHE_SECONDS = max(15, int(os.getenv("CATALOG_CACHE_SECONDS", "120")))
+RESPONSE_CACHE_SECONDS = max(0, int(os.getenv("RESPONSE_CACHE_SECONDS", "120")))
 
 MODEL_HEALTH: Dict[str, Dict[str, Any]] = {}
 
@@ -174,6 +191,8 @@ _catalog_cache: Dict[str, Any] = {
 }
 
 _response_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_tts_cache: Dict[str, bytes] = {}
+_tts_cache_order: List[str] = []
 
 _table_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
 
@@ -203,7 +222,6 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
-    schema: Optional[str] = None
     last_member_id: Optional[str] = None
     history: List[Dict[str, Any]] = Field(default_factory=list)
     model: Optional[str] = None
@@ -212,6 +230,10 @@ class ChatRequest(BaseModel):
     domain: Optional[str] = None
     page: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=4000)
 
 
 class ChatResponse(BaseModel):
@@ -1395,7 +1417,7 @@ def _history_messages(
 ) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
 
-    for item in history[-8:]:
+    for item in history[-6:]:
         role = _clean_text(item.get("role")).lower()
         content = _clean_text(item.get("content") or item.get("message"))
 
@@ -1510,6 +1532,53 @@ def _tavily_search(query: str) -> Tuple[bool, str]:
 
     except Exception as e:
         return False, str(e)
+
+
+# =============================================================================
+# SERVER NEURAL TTS
+# =============================================================================
+
+def _clean_tts_text(text: str) -> str:
+    value = _clean_text(text)
+    value = re.sub(r"https?://\S+", "", value, flags=re.I)
+    value = value.replace("**", "").replace("__", "")
+    value = re.sub(r"\s+", " ", value).strip()
+
+    if len(value) > TTS_MAX_CHARS:
+        value = value[:TTS_MAX_CHARS]
+        cut = value.rfind(" ")
+        if cut > int(TTS_MAX_CHARS * 0.72):
+            value = value[:cut]
+        value = value.rstrip(" ,;:-") + "."
+
+    return value
+
+
+def _tts_cache_get(key: str) -> Optional[bytes]:
+    audio = _tts_cache.get(key)
+    if audio is None:
+        return None
+    try:
+        _tts_cache_order.remove(key)
+    except ValueError:
+        pass
+    _tts_cache_order.append(key)
+    return audio
+
+
+def _tts_cache_set(key: str, audio: bytes) -> None:
+    if not audio:
+        return
+    _tts_cache[key] = audio
+    try:
+        _tts_cache_order.remove(key)
+    except ValueError:
+        pass
+    _tts_cache_order.append(key)
+
+    while len(_tts_cache_order) > TTS_CACHE_ITEMS:
+        oldest = _tts_cache_order.pop(0)
+        _tts_cache.pop(oldest, None)
 
 
 # =============================================================================
@@ -2042,104 +2111,6 @@ def _deterministic_repair(
     return repaired or _catalog_fallback(intent, selected_items)
 
 
-# =============================================================================
-# SECOND-MODEL VERIFICATION
-# =============================================================================
-
-def _verification_prompt(
-    question: str,
-    candidate: str,
-    evidence: str,
-) -> List[Dict[str, str]]:
-    return [
-        {
-            "role": "system",
-            "content": """
-You are Faithi's answer verifier. Check only factual grounding.
-Do not add new facts. Return JSON only:
-{"supported": true/false, "reason": "short reason"}
-A Faith Hairstyle-specific claim is supported only when it appears in the
-provided evidence.
-""".strip(),
-        },
-        {
-            "role": "user",
-            "content": f"""
-QUESTION:
-{question}
-
-CANDIDATE ANSWER:
-{candidate}
-
-EVIDENCE:
-{evidence}
-""".strip(),
-        },
-    ]
-
-
-def _optional_second_model_verify(
-    question: str,
-    candidate: str,
-    evidence: str,
-    generation_model: Optional[str],
-) -> Dict[str, Any]:
-    alternatives = [
-        m for m in _smart_model_order()
-        if m != generation_model
-    ]
-
-    if not alternatives:
-        return {
-            "used": False,
-            "supported": None,
-            "reason": "No second healthy/untested model available.",
-        }
-
-    verifier = alternatives[0]
-
-    ok, text, error, latency_ms = _hf_chat_single(
-        verifier,
-        _verification_prompt(question, candidate, evidence),
-        max_tokens=90,
-    )
-
-    if not ok:
-        _mark_model(verifier, False, latency_ms, error)
-        return {
-            "used": True,
-            "model": verifier,
-            "supported": None,
-            "reason": error[:250],
-        }
-
-    _mark_model(verifier, True, latency_ms, "")
-
-    supported = None
-    reason = text[:300]
-
-    try:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if match:
-            obj = json.loads(match.group(0))
-            supported = bool(obj.get("supported"))
-            reason = _clean_text(obj.get("reason"))[:300]
-    except Exception:
-        low = text.lower()
-        if '"supported": true' in low or "supported: true" in low:
-            supported = True
-        elif '"supported": false' in low or "supported: false" in low:
-            supported = False
-
-    return {
-        "used": True,
-        "model": verifier,
-        "supported": supported,
-        "reason": reason,
-        "latency_ms": latency_ms,
-    }
-
-
 def _reasoning_plan(
     text: str,
     intent: IntentType,
@@ -2151,14 +2122,11 @@ def _reasoning_plan(
         retrieval_meta.get("retrieval_confidence") or 0.0
     )
 
-    verify_with_second_model = False
-
     return {
         "intent": intent.value,
         "intent_confidence": intent_confidence,
         "grounding_risk": risk.value,
         "retrieval_confidence": retrieval_conf,
-        "second_model_verification": verify_with_second_model,
         "stages": [
             ReasoningStage.NORMALIZE.value,
             ReasoningStage.CLASSIFY.value,
@@ -2170,6 +2138,57 @@ def _reasoning_plan(
             ReasoningStage.COMPLETE.value,
         ],
     }
+
+
+def _fast_catalog_response(intent: IntentType, query: str) -> ChatResponse:
+    items, retrieval = _advanced_catalog_search(query, limit=10)
+
+    if not items and intent == IntentType.SERVICES:
+        items = [
+            x for x in _load_catalog()
+            if x.get("_table") == "services" and x.get("is_active") is not False
+        ][:10]
+
+    reply = _catalog_fallback(intent, items)
+    safe_rows = [_safe_service_view(x) for x in items]
+
+    return ChatResponse(
+        reply=reply,
+        used_source="supabase-fast",
+        member_id_focus=None,
+        dataframe=_df_payload(safe_rows, limit=10),
+        meta={
+            "assistant": ASSISTANT_NAME,
+            "brand": BRAND_NAME,
+            "version": APP_VERSION,
+            "intent": intent.value,
+            "fast_path": True,
+            "model": None,
+            "retrieval": retrieval,
+            "database_grounded": bool(safe_rows),
+        },
+    )
+
+
+def _fast_business_response(intent: IntentType) -> ChatResponse:
+    rows = _relevant_business_context(intent)
+    reply = _business_fallback(intent, rows)
+
+    return ChatResponse(
+        reply=reply,
+        used_source="supabase-fast",
+        member_id_focus=None,
+        dataframe=_df_payload(rows[:12], limit=12),
+        meta={
+            "assistant": ASSISTANT_NAME,
+            "brand": BRAND_NAME,
+            "version": APP_VERSION,
+            "intent": intent.value,
+            "fast_path": True,
+            "model": None,
+            "database_grounded": bool(rows),
+        },
+    )
 
 
 # =============================================================================
@@ -2227,6 +2246,17 @@ def _advanced_chat_pipeline(req: ChatRequest) -> ChatResponse:
 
     if intent == IntentType.AVAILABILITY:
         return _fast_availability_response()
+
+    if intent in {IntentType.SERVICES, IntentType.PRICES}:
+        return _fast_catalog_response(intent, reasoning_text)
+
+    if intent in {
+        IntentType.HOURS,
+        IntentType.LOCATION,
+        IntentType.CONTACT,
+        IntentType.POLICY,
+    }:
+        return _fast_business_response(intent)
 
     cache_payload = {
         "message": reasoning_text,
@@ -2363,11 +2393,6 @@ def _advanced_chat_pipeline(req: ChatRequest) -> ChatResponse:
         risk=risk,
     )
 
-    second_verification: Dict[str, Any] = {
-        "used": False,
-        "supported": None,
-    }
-
     if ok:
         generated = _sanitize_output(generated)
 
@@ -2377,27 +2402,6 @@ def _advanced_chat_pipeline(req: ChatRequest) -> ChatResponse:
             selected_items,
             business_rows,
         )
-
-        if (
-            plan["second_model_verification"]
-            and verification["passed"]
-        ):
-            second_verification = _optional_second_model_verify(
-                question=original_text,
-                candidate=generated,
-                evidence=db_context[:12000],
-                generation_model=model_used,
-            )
-
-            if second_verification.get("supported") is False:
-                verification["passed"] = False
-                verification["issues"].append(
-                    "second_model_grounding_rejection"
-                )
-                verification["score"] = min(
-                    verification["score"],
-                    0.60,
-                )
 
         if verification["passed"]:
             reply = generated
@@ -2470,7 +2474,6 @@ def _advanced_chat_pipeline(req: ChatRequest) -> ChatResponse:
             "model": model_used,
             "model_attempts": attempts,
             "verification": verification,
-            "second_model_verification": second_verification,
             "corrected_for_reasoning": (
                 reasoning_text
                 if reasoning_text != original_text
@@ -2556,6 +2559,8 @@ def health():
             SUPABASE_URL and _supabase_key()
         ),
         "hf_configured": bool(HF_TOKEN),
+        "tts_voice": TTS_VOICE,
+        "tts_rate": TTS_RATE,
         "internet_configured": bool(
             TAVILY_API_KEY and INTERNET_MODE
         ),
@@ -2745,6 +2750,65 @@ def refresh_catalog():
     }
 
 
+@app.post("/tts")
+async def tts(req: TTSRequest):
+    text = _clean_tts_text(req.text)
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required.")
+
+    cache_key = hashlib.sha256(
+        f"{TTS_VOICE}|{TTS_RATE}|{TTS_PITCH}|{text}".encode("utf-8")
+    ).hexdigest()
+
+    cached = _tts_cache_get(cache_key)
+    if cached is not None:
+        return Response(
+            content=cached,
+            media_type="audio/mpeg",
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "X-Faithi-Voice": TTS_VOICE,
+                "X-Faithi-TTS-Cache": "hit",
+            },
+        )
+
+    try:
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=TTS_VOICE,
+            rate=TTS_RATE,
+            pitch=TTS_PITCH,
+        )
+
+        audio = bytearray()
+        async for chunk in communicate.stream():
+            if chunk.get("type") == "audio":
+                data = chunk.get("data")
+                if data:
+                    audio.extend(data)
+
+        if not audio:
+            raise RuntimeError("Neural voice provider returned no audio.")
+
+        payload = bytes(audio)
+        _tts_cache_set(cache_key, payload)
+
+        return Response(
+            content=payload,
+            media_type="audio/mpeg",
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "X-Faithi-Voice": TTS_VOICE,
+                "X-Faithi-TTS-Cache": "miss",
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Faithi neural voice is temporarily unavailable: {str(exc)[:180]}",
+        ) from exc
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     return _advanced_chat_pipeline(req)
@@ -2761,6 +2825,7 @@ def chat(req: ChatRequest):
 # requests
 # supabase
 # pydantic
+# edge-tts
 #
 # Railway variables:
 # SUPABASE_URL
@@ -2771,6 +2836,8 @@ def chat(req: ChatRequest):
 # TAVILY_API_KEY
 # INTERNET_MODE=true
 # HF_MODEL_PRIMARY=meta-llama/Llama-3.1-8B-Instruct
+# TTS_VOICE=en-US-AvaNeural
+# TTS_RATE=+18%
 # FAITH_PUBLIC_TABLES  # optional; blank = auto-discover customer-safe relations
 # FAITH_BLOCKED_TABLES # optional additional exclusions
 #
